@@ -86,8 +86,13 @@ The full steps are in the
 2. Build the plugins from <https://github.com/millaguie/radiance-hy4flash> against radiance 2.2.0
    (`tools/build-hip.sh`) and copy `build-hip-22/radiance_home` to `~/hy4/home`, with
    `data/chat_template.jinja` and `deploy/example-tp2-dfly2.yaml` beside it in `~/hy4`.
-3. Download the container:
-   `hf download millaguie/Hy4-flash-radiance-W4NL64-IQ8R-DFly2 --include '*.rad' --local-dir ~/models/rad`
+3. Download the container. Hugging Face takes files of at most 50 GB, so the 140 GiB `.rad` is in
+   four parts: download them, join them and check the result.
+
+   ```sh
+   hf download millaguie/Hy4-flash-radiance-W4NL64-IQ8R-DFly2 --local-dir ~/models/rad
+   cd ~/models/rad && cat hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad.part* > hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad && sha256sum -c SHA256SUMS
+   ```
 4. Start the server:
 
 ```sh

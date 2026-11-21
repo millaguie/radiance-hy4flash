@@ -134,10 +134,15 @@ docker run --rm -v ~/hy4/home:/plugins:ro -e RADIANCE_HOME=/plugins:/opt/radianc
     --entrypoint rad-info stilldeadcode/radiance:2.2.0 --plugins
 ```
 
-**4. Download the container** (one `.rad` file, 140 GiB) to a local NVMe drive:
+**4. Download the container** (one `.rad` file, 140 GiB) to a local NVMe drive. Hugging Face takes
+files of at most 50 GB, so it is uploaded in four parts; join them and check the result:
 
 ```sh
-hf download millaguie/Hy4-flash-radiance-W4NL64-IQ8R-DFly2 --include '*.rad' --local-dir ~/models/rad
+hf download millaguie/Hy4-flash-radiance-W4NL64-IQ8R-DFly2 --include 'hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad.part*' 'SHA256SUMS' --local-dir ~/models/rad
+cd ~/models/rad
+cat hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad.part* > hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad
+sha256sum -c SHA256SUMS      # every part and the joined file must say OK
+rm hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad.part*                 # once the check passes: 140 GiB back
 ```
 
 **5. The config.** [`deploy/example-tp2-dfly2.yaml`](deploy/example-tp2-dfly2.yaml), copied to
