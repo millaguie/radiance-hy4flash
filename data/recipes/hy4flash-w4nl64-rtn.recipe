@@ -1,0 +1,12 @@
+# hy4flash-w4nl64-rtn.recipe -- Tencent Hy4-flash from its BF16 checkpoint: the routed experts in
+# rotated (fwht128) u4 codes over the w4nl codebook, with an E4M3 scale per (row, 64 of K) under the
+# fixed f32 2^-13 (libr4d's w4nl64a8h, docs/MOE-W4.md), by plain rounding with the searched scale
+# (rule=search); the rest as the checkpoint ships it (BF16 trunk, BF16 Engram table).
+#
+#   rad-convert <checkpoint> --recipe data/recipes/hy4flash-w4nl64-rtn.recipe -o hy4-flash-w4nl64-rtn.rad
+#
+# The kernel fixes 2^-13 (kW4G64Scale) and loading checks it. The scales of Hy4's experts, with the
+# 128 rotation folded in, range from 2^-13.4 to 2^-10.5 (layers 1, 10, 21 and 40, 1 expert in every
+# 37): normal in E4M3 under 2^-13 (range 2^-19 to 2^-4.2). Only in layer 1 are 4 % of the gate_up
+# groups close to zero, and they fall to subnormal.
+blk.*.ffn_*_exps.*.weight            rtn table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search

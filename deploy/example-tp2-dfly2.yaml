@@ -1,0 +1,36 @@
+# The released container on two 32 GB cards (2x Radeon AI PRO R9700, 64 GB of host RAM): GPTQ 4-bit
+# experts tiered between VRAM and a pinned host pool, IQ8R trunk, the DFly2 drafter with the adaptive
+# window, the Engram tables read from the drive. radiance 2.2.0 with the plugins of this repository
+# in /hy4/home (README.md, "How to run it"). With DFly2 and several clients on 2.2.0, start the
+# server with RADIANCE_AQL_CHAIN_FENCE=1 (docs/DESIGN.md, "Moving to radiance 2.2.0").
+# template-sha256: 3a2f6a781bb416d4d3ead906bedee5e9d91691bd505f27fd35f3e71955d3ad3a
+server:
+  host: 127.0.0.1
+  port: 8000
+  kernels: hy4k,libr4d,libavx
+  radiance-home: /hy4/home:/opt/radiance/share/radiance
+memory:
+  gpu-headroom-mib: 128
+models:
+  hy4-flash:
+    aliases: [tencent/Hy4-flash]
+    model: /models/hy4-flash-w4nl64-gptq-iq8r-dfly2-e4m3.rad
+    tp: 2
+    placement: expert_tiered
+    # The experts that do not fit the cards sit in pinned host memory: 39 GB of a 64 GB host.
+    host-pool-mib: 39000
+    # The Engram tables (59 GiB of E4M3 codes) stay on the drive: put the container on an NVMe.
+    ngram-placement: disk
+    # The container was converted with --max-ctx 65536.
+    max-model-len: 65536
+    max-num-batched-tokens: 2048
+    max-num-seqs: 8
+    # Text only: the container holds no vision tower.
+    mm-max-patches: 0
+    # DFly2: 5 drafted tokens a step; the adaptive window keeps the gain with several clients.
+    num-speculative-tokens: 5
+    draft-window: adaptive
+    # The container's template is this one already; the override pins it to the file.
+    override-chat-template: /hy4/chat_template.jinja
+    # Hy4-flash thinks at `high` or not at all (`no_think`): the other OpenAI levels map onto the two.
+    reasoning-effort-map: {low: high, medium: high, xhigh: high, max: high, minimal: no_think, none: no_think}

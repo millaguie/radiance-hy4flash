@@ -1,0 +1,22 @@
+# Build and install trees (tools/build-hip.sh, the CMake build, a local radiance install)
+build*/
+prefix*/
+home*/
+dbg/
+
+# Python
+ref/.venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Local copies of upstream files kept for review
+.revision/
+
+# Generated: converted containers, dumps, logs, kernel bench output
+*.rad
+*.rad.pre-append*
+*.safetensors
+*.log
+kbench/

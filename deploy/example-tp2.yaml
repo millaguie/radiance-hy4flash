@@ -1,0 +1,32 @@
+# Hy4-flash plan step 8: the whole model (RTN w4nl64, BF16 trunk) on two R9700s with offloading.
+# Copy it to the working directory ($HY4_DIR, default ~/hy4) as hy4-full.yaml; deploy/run-hy4.sh
+# mounts that directory on /hy4 (with the template from data/ copied to it as chat_template.jinja
+# and the plugins in its home/) and the models directory on /models.
+# Launch: sudo CFG=hy4-full.yaml ./run-hy4.sh
+# The released container (GPTQ experts, IQ8R trunk, DFly2 drafter) is served with
+# deploy/example-tp2-dfly2.yaml.
+# template-sha256: 3a2f6a781bb416d4d3ead906bedee5e9d91691bd505f27fd35f3e71955d3ad3a
+server:
+  host: 127.0.0.1
+  port: 18093
+  kernels: hy4k,libr4d,libavx
+  radiance-home: /hy4/home:/opt/radiance/share/radiance
+memory:
+  gpu-headroom-mib: 128
+models:
+  hy4-flash:
+    model: /models/hy4-flash-w4nl64-rtn.rad
+    tp: 2
+    placement: expert_tiered
+    host-pool-mib: 39000
+    ngram-placement: disk
+    max-model-len: 16384
+    max-num-batched-tokens: 2048
+    # Text only: the official image (unpatched radiance) has no Hy4 vision processor and refuses
+    # to start with the tower ("the vision encoder has no processor").
+    mm-max-patches: 0
+    max-num-seqs: 1
+    num-speculative-tokens: 0
+    no-prefix-cache: true
+    override-chat-template: /hy4/chat_template.jinja
+    reasoning-effort-map: {low: high, medium: high, xhigh: high, max: high, minimal: no_think, none: no_think}

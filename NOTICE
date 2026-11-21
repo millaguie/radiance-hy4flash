@@ -1,0 +1,26 @@
+radiance-hy4flash
+Copyright 2026 Millaguie
+
+Plugins for the radiance inference server (https://codeberg.org/StillDeadcode/radiance) that serve
+Tencent's Hy4-flash: the architecture plugin `hyv4flash` and the op library `hy4k`. Licensed under
+the Apache License, Version 2.0 (see LICENSE).
+
+This repository includes material from other works:
+
+- arch/hyv4flash/vendor/arch/rad_fp8.h is a modified copy of radiance 2.2.0's
+  arch/common/rad_fp8.h. Copyright 2026 Deadcode and the radiance contributors, licensed under the
+  Apache License, Version 2.0. Modification: GateQuantFP8 accepts a rotated E4M3 consumer (`rot`)
+  together with the clamp, by writing the clamped product to the bf16 plane and quantising it with
+  `had_quant_act_fp8`; the changed lines are marked "hyv4flash (vendor)" and the file's first
+  comment states the change.
+
+- data/chat_template.jinja is a modified copy of the chat template of tencent/Hy4-flash
+  (https://huggingface.co/tencent/Hy4-flash), by the Tencent Hy Team, licensed under the Tencent Hy
+  License, Version 1.0. Modification: its 22 `'...{}...'.format(HYTK)` expressions are rewritten as
+  `~` concatenations, which radiance's Jinja renders; the rendered prompt is the same.
+
+- ref/hy4-config.json is an unmodified copy of that model's config.json, under the same license.
+
+A copy of the Tencent Hy License, Version 1.0 is in hf/LICENSE. The Hy4-flash model weights are not
+part of this repository; they, and any container converted from them, stay under that license,
+including its Section 10.

@@ -1,0 +1,29 @@
+# hy4flash-w4nl64-gptq-iq8r.recipe -- hy4flash-w4nl64-gptq.recipe with the dense trunk in IQ8R: int8
+# codes in -127..127, one u8 scale per (row, 256 of K) under one bf16 scale a row, each 128 of K rotated
+# by the unnormalised Hadamard before rounding, round to nearest with a scale search (radiance's
+# data/recipes/ling-3.0-tiny-iq8r.recipe). This build refuses block-fp8 linears; IQ8R is the int8 form
+# libr4d serves (gemm_iq8r_nt_m16 up to 64 rows, gemm_iq8r_tiled above, N a multiple of 128 there).
+#
+# In IQ8R: the attention q_a/q_b, the head gate and the output, the dense FFN of layer 0, the MoE
+# latent projections and the shared expert. Kept bf16: attn_kv_a (N 576) and idx_hw (N 16), which no
+# int8 row above 64 rows serves; the rest of the indexer (its top-k is a hard choice, rad_fp8.h keeps
+# the indexer at checkpoint precision); attn_kv_b and attn_kv_b_abs (mla_project is bf16); Engram, the
+# norms, the router and the hyper-connections. The bf16 trunk was 15.7 ms of a ~28 ms decode step.
+#
+# Applied in place to the GPTQ container (the experts' rule is the one it was built with, so the
+# experts are kept; --replace names every linear below):
+#   HY4_BUILD=build-hip2 CALIB=<Grams> HY4_MLA=both tools/convert-hip.sh <checkpoint> --recipe <this> \
+#       --reuse <gptq.rad> --in-place --replace 'blk.*.attn_q_a.weight' ... --set hy4.trunk_i8=1 \
+#       --max-spec 0 --max-ctx 65536 -o <gptq.rad>
+# The plugin reads hy4.trunk_i8 at convert and serve time (Geom::w_bf16, w_i8h).
+blk.*.ffn_*_exps.*.weight            gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
+blk.*.attn_q_a.weight                rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_q_b.weight                rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_gate.weight               rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.attn_output.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up.weight             rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down.weight                rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_latent_in.weight           rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_latent_out.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_gate_up_shexp.weight       rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search
+blk.*.ffn_down_shexp.weight          rtn  codes=i8 group=256 scale=u8 scale2=bf16 block2=1x* transform=fwht128 clamp=sym rule=search

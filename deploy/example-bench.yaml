@@ -1,0 +1,29 @@
+# Hy4-flash plan step 10: the GPTQ on the two R9700s, on port 8000 for a throughput bench
+# (deploy/run-hy4-bench.sh). Same memory as plan step 8; context and batching as Qwen3.8-Flash-Next
+# is served on the same cards (max-num-seqs 8, max-num-batched-tokens 2048) as far as they fit.
+# A bench that asks for the model under another name: add it to `aliases`.
+# template-sha256: 3a2f6a781bb416d4d3ead906bedee5e9d91691bd505f27fd35f3e71955d3ad3a
+server:
+  host: 0.0.0.0
+  port: 8000
+  kernels: hy4k,libr4d,libavx
+  radiance-home: /hy4/home:/opt/radiance/share/radiance
+memory:
+  gpu-headroom-mib: 128
+models:
+  hy4-flash:
+    aliases: [tencent/Hy4-flash]
+    model: /models/hy4-flash-w4nl64-gptq.rad
+    tp: 2
+    placement: expert_tiered
+    host-pool-mib: 39000
+    ngram-placement: disk
+    max-model-len: 196608
+    max-num-batched-tokens: 2048
+    # Text only: the official image (unpatched radiance) has no Hy4 vision processor and refuses
+    # to start with the tower ("the vision encoder has no processor").
+    mm-max-patches: 0
+    max-num-seqs: 8
+    num-speculative-tokens: 0
+    override-chat-template: /hy4/chat_template.jinja
+    reasoning-effort-map: {low: high, medium: high, xhigh: high, max: high, minimal: no_think, none: no_think}

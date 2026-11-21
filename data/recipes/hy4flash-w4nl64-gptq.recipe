@@ -1,0 +1,13 @@
+# hy4flash-w4nl64-gptq.recipe -- Tencent Hy4-flash from its BF16 checkpoint: the routed experts
+# as in hy4flash-w4nl64-rtn.recipe (u4 codes rotated by fwht128 over the w4nl codebook, an E4M3 scale per
+# (row, 64 of K) under the fixed f32 2^-13; libr4d's w4nl64a8h), but quantised by GPTQ against the
+# Grams the calibration tap records, with three coordinate-descent passes (cd=3, radiance's
+# docs/MOE-W4.md). The rest as the checkpoint ships it (BF16 trunk, BF16 Engram).
+#
+#   CALIB=<Grams dir> tools/convert-hip.sh <checkpoint> --recipe /hy4data/recipes/hy4flash-w4nl64-gptq.recipe \
+#       --reuse <the RTN container> -o <output> ...
+#
+# --reuse copies from the RTN everything that does not change (all but the experts). A weight without
+# its Gram is quantised uncalibrated and says so on stderr: check the log. The scales come from the
+# weight, as in the RTN (static-group GPTQ), so 2^-13 still holds (see the RTN recipe).
+blk.*.ffn_*_exps.*.weight            gptq table=w4nl group=64 scale=fp8_e4m3 scale2=f32 block2=*x* scale2_value=0.0001220703125 transform=fwht128 rule=search cd=3 calib=$CALIB
