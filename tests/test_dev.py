@@ -153,8 +153,16 @@ def main():
     cands = [ROOT / d / "radiance_home/kernels/hy4k.so" for d in ("build-hip-22",)]
     cands = [c for c in cands if c.exists()]
     ap.add_argument("--so", default=str(max(cands, key=lambda c: c.stat().st_mtime) if cands else cands))
+    # --chain: every card call carries chain = 1, as the engine resolves a row where chaining is on, so
+    # the chained forms (r4dchain) run. HIP writes no chain record, so they neither wait nor count: the
+    # run checks that the chained forms compute what the plain ones do.
+    ap.add_argument("--chain", action="store_true")
     a = ap.parse_args()
     pl = RC.Plugin(Path(a.so))
+    if a.chain:
+        call0 = pl.call
+        pl.call = lambda kernel, tensors, params, **kw: call0(
+            kernel, tensors, {**params, "chain": 1} if kernel.startswith("hy4_dev_") else params, **kw)
     torch.manual_seed(7)
     I32, I64 = torch.int32, torch.int64
 
@@ -523,6 +531,7 @@ def main():
     # attn_paged_sink against a torch reference (the hy4k host does not have one)
     attention(pl)
     latent_attention(pl)
+    latent_attention_2g(pl)
     dfly(pl)
     print("OK" if all(results) else "FAIL")
     return 0 if all(results) else 1
@@ -947,6 +956,126 @@ def latent_attention(pl):
         compare(f"hy4_rope {name}", qh, qd.to_host()) if rh == 0 and rd == 0 else report("hy4_rope rc", False, f"{rh} {rd}")
 
 
+def latent_attention_2g(pl):
+    """hy4_mla_attn's form 2g (opt-in: HY4_MLA_ATTN=g, here the parameter mla_form 6; heads grouped by 16
+    on WMMA, history split in slices fixed by the head count, mla_attn2g_k + mla_merge_k) at Hy4's decode geometry: 16 heads over a 2048-key selection and
+    32 heads over a 512 window at 4000 of context, 1 to 32 rows. Against the oracle; a row gives the same
+    bits alone as in any batch of up to 32; the slice count (`mla_splits`) changes only the rounding;
+    rows with fewer keys than slices, no key, NaN and infinities as the oracle; rows outside cu not
+    written; without scratch the call runs the per-head form 2 (`mla_form` 5), with its own bits."""
+    I32 = torch.int32
+    L, R, bs, P = 512, 64, 4, 1200
+    cache = bf(torch.randn(P, 1, bs, L + R))
+
+    def params(rows, H, window, **kw):   # form 2g on (mla_form 6, what HY4_MLA_ATTN=g serves) unless kw says
+        return {"M": rows, "heads": H, "latent": L, "rope": R, "block_size": bs, "window": window, "scale": 1.0 / 16,
+                "dtype": "bf16", "mla_form": 6, **kw}
+
+    def card(q, qr, extra, H, window, sinks, scratch=True, out=None, cache_=None, **kw):
+        rows = q.shape[0]
+        d = Dev(bf(torch.zeros(rows, H, L)) if out is None else out.clone())
+        ins = [Dev(t) if t is not None else None for t in [q, qr, cache if cache_ is None else cache_] + extra + [sinks]]
+        p = params(rows, H, window, **kw)
+        rc = dev_call(pl, "hy4_dev_mla_attn", ins + [d], p) if scratch else pl.call("hy4_dev_mla_attn", ins + [d], p)
+        return rc, d.to_host()
+
+    def oracle(name, q, qr, extra, H, window, sinks, cache_=None, **kw):
+        o = bf(torch.zeros(q.shape[0], H, L))
+        sh, out, _ = run_both(pl, "mla_attn", [q, qr, cache if cache_ is None else cache_] + extra + [sinks], [o],
+                              params(q.shape[0], H, window, **kw))
+        compare(f"mla_attn 2g {name}", sh[0], out[0])
+        return sh[0], out[0]
+
+    def qs(rows, H, mul=1 / 8):
+        return bf(torch.randn(rows, H, L) * mul), bf(torch.randn(rows, H, R) * mul)
+
+    # sparse layers: 16 heads, one selection of 512 pages (2048 keys) a row
+    H16, sk16 = 16, torch.randn(16)
+    sel = torch.stack([torch.randperm(P)[:512] for _ in range(32)]).to(I32)
+    sq = torch.full((32,), 2048, dtype=I32)
+    sq[3], sq[7], sq[9] = 1500, 5, 0          # a short history, fewer keys than slices, none at all
+    q16, qr16 = qs(32, H16)
+    for rows in (1, 4, 8, 32):
+        oracle(f"selection, 16 heads, {rows} rows", q16[:rows].contiguous(), qr16[:rows].contiguous(),
+               [sel[:rows].contiguous(), sq[:rows].contiguous(), None], H16, 0, sk16)
+    _, b32 = card(q16, qr16, [sel, sq, None], H16, 0, sk16)
+    same = all(torch.equal(card(q16[r:r + 1].contiguous(), qr16[r:r + 1].contiguous(),
+                                [sel[r:r + 1].contiguous(), sq[r:r + 1].contiguous(), None], H16, 0, sk16)[1][0], b32[r])
+               for r in (0, 3, 7, 9, 31))
+    report("mla_attn 2g batch-invariant (selection, 1 row = in 32)", same)
+    report("mla_attn 2g: a row with no key gives zeros", bool((b32[9].float() == 0).all()))
+    # window layers: 32 heads, window 512 at 4000 of context; decode rows and a 6-row verify sequence
+    H32, sk32 = 32, torch.randn(32)
+    btw = torch.randint(0, P, (6, 1000), dtype=I32)
+    btw[2, 900] = -1                            # a bad page inside the window
+    btw[4, 990] = P + 7
+    suw = torch.tensor([4000, 3999, 3001, 600, 2002, 4000], dtype=I32)
+    cuw = torch.tensor([0, 1, 2, 3, 4, 5, 11], dtype=I32)   # five decode rows, then a verify of 6
+    q32, qr32 = qs(11, H32)
+    _, w11 = oracle("window 512, 32 heads, 5 decode rows and a 6-row verify", q32, qr32, [btw, suw, cuw], H32, 512, sk32)
+    # the verify's row 3 (position 3997) alone: a sequence of one row at seqused 3998
+    _, w1 = card(q32[8:9].contiguous(), qr32[8:9].contiguous(),
+                 [btw[5:6].contiguous(), torch.tensor([3998], dtype=I32), torch.tensor([0, 1], dtype=I32)], H32, 512, sk32)
+    report("mla_attn 2g: a verify row = the decode row at its position (bits)", torch.equal(w1[0], w11[8]))
+    # the slice count only moves the rounding: 1, 3 and 64 slices against the oracle, and different bits
+    for S in (1, 3, 64):
+        oracle(f"selection, {S} slices", q16[:8].contiguous(), qr16[:8].contiguous(),
+               [sel[:8].contiguous(), sq[:8].contiguous(), None], H16, 0, sk16, mla_splits=S)
+    # the per-head form 2 (mla_form 5, HY4_MLA_ATTN=h): both close to the oracle, other bits
+    _, g8 = card(q16[:8].contiguous(), qr16[:8].contiguous(), [sel[:8].contiguous(), sq[:8].contiguous(), None], H16, 0, sk16)
+    rc5, h8 = card(q16[:8].contiguous(), qr16[:8].contiguous(), [sel[:8].contiguous(), sq[:8].contiguous(), None], H16, 0,
+                   sk16, mla_form=5)
+    nd = int((g8.view(torch.int16) != h8.view(torch.int16)).sum())
+    report("mla_attn 2g against the per-head form 2: other rounding only", rc5 == 0 and nd > 0,
+           f"{nd} of {g8.numel()} values differ")
+    rcn, n8 = card(q16[:8].contiguous(), qr16[:8].contiguous(), [sel[:8].contiguous(), sq[:8].contiguous(), None], H16, 0,
+                   sk16, scratch=False)
+    report("mla_attn 2g without scratch: the per-head form 2 (bits)", rcn == 0 and torch.equal(n8, h8))
+    report("mla_attn 2g: scratch only at form 2g's geometry",
+           pl.scratch_bytes("hy4_dev_mla_attn", [], params(8, 16, 0)) == 8 * 16 * 16 * 516 * 4 and
+           pl.scratch_bytes("hy4_dev_mla_attn", [], params(8, 8, 0)) == 0 and
+           pl.scratch_bytes("hy4_dev_mla_attn", [], params(2048, 32, 0)) == 64 * 32 * 8 * 516 * 4 and
+           pl.scratch_bytes("hy4_dev_mla_attn", [], params(8, 16, 0, mla_form=5)) == 0 and
+           pl.scratch_bytes("hy4_dev_mla_attn", [], params(8, 16, 0, mla_form=0)) == 0)   # off by default
+    # rows outside cu are not written
+    _, oc = card(q32[:6].contiguous(), qr32[:6].contiguous(), [btw[:3].contiguous(), suw[:3].contiguous(),
+                 torch.tensor([0, 2, 4, 4], dtype=I32)], H32, 512, sk32, out=bf(torch.full((6, H32, L), 7.0)))
+    report("mla_attn 2g does not write the rows outside cu", bool((oc.float()[4:] == 7.0).all()) and
+           not bool((oc.float()[:4] == 7.0).any()))
+    # sink above every score, and -inf
+    oracle("sink above everything", q32, qr32, [btw, suw, cuw], H32, 512, torch.full((H32,), 50.0))
+    oracle("sink -inf", q32, qr32, [btw, suw, cuw], H32, 512, torch.full((H32,), float("-inf")))
+    oracle("peaked scores", *qs(11, H32, 2.0), [btw, suw, cuw], H32, 512, sk32)
+    # a NaN in a cache row: the rows that see it give NaN, as the oracle
+    cn = cache.clone()
+    cn[int(sel[1, 100]), 0, 2, 5] = float("nan")
+    shn, outn = oracle("NaN in the cache (finite rows)", q16[:4].contiguous(), qr16[:4].contiguous(),
+                       [sel[:4].contiguous(), sq[:4].contiguous(), None], H16, 0, sk16, cache_=cn)
+    report("mla_attn 2g propagates NaN like the host",
+           torch.equal(torch.isnan(shn.float()), torch.isnan(outn.float())) and bool(torch.isnan(outn.float()).any()))
+    # +inf in q and a +inf sink give NaN; a -inf sink weighs nothing
+    qi, qri = qs(8, H16)
+    qi[1, 0, 3] = float("inf")
+    ski = torch.randn(H16)
+    ski[H16 - 1], ski[2] = float("inf"), float("-inf")
+    shi, outi = oracle("infinities", qi, qri, [sel[:8].contiguous(), sq[:8].contiguous(), None], H16, 0, ski)
+    report("mla_attn 2g: +inf and sink +inf give NaN like the host",
+           torch.equal(torch.isnan(shi.float()), torch.isnan(outi.float())))
+    # every visible score -inf beside an infinite sink (NaN) and a finite one (zeros)
+    cpos = bf(torch.rand(P, 1, bs, L + R) + 0.5)
+    qn2 = bf(torch.randn(8, H16, L) / 8)
+    qn2[:, :, 0] = float("-inf")
+    sk2 = torch.randn(H16)
+    sk2[0], sk2[1] = float("inf"), float("-inf")
+    o7 = bf(torch.full((8, H16, L), 7.0))
+    p8 = params(8, H16, 0)
+    ins = [qn2, bf(torch.zeros(8, H16, R)), cpos, sel[:8].contiguous(), sq[:8].contiguous(), None, sk2]
+    sh2, out2, _ = run_both(pl, "mla_attn", ins, [o7], p8)
+    report("mla_attn 2g: -inf scores and infinite sink like the host",
+           torch.equal(torch.isnan(sh2[0].float()), torch.isnan(out2[0].float())) and
+           torch.equal(torch.nan_to_num(sh2[0].float()), torch.nan_to_num(out2[0].float())))
+
+
 def dfly(pl):
     """The DFly2 ops (docs/DFLY2.md): hy4_ring_store and hy4_ring_load bit for bit against the host, and
     hy4_mla_attn's block keys (form 2 only) at Hy4's geometry against the host oracle with the form-2
@@ -1120,9 +1249,11 @@ def dfly(pl):
             o1 = bf(torch.zeros(1, H, L))
             p1 = {"M": 1, "heads": H, "latent": L, "rope": R, "block_size": bs, "window": 0, "scale": scale, "dtype": "bf16"}
             d1 = Dev(o1.clone())
-            rc1 = pl.call("hy4_dev_mla_attn", [Dev(q[r:r + 1].contiguous()), Dev(qr[r:r + 1].contiguous()), Dev(cu_cache),
-                                               Dev(sel_u), Dev(torch.tensor([n_u], dtype=I32)), None, Dev(sinks), d1],
-                          p1)
+            # with the scratch the engine gives, as the batch above (the per-head form by default; form 2g
+            # under HY4_MLA_ATTN=g, which latent_attention_2g covers)
+            rc1 = dev_call(pl, "hy4_dev_mla_attn", [Dev(q[r:r + 1].contiguous()), Dev(qr[r:r + 1].contiguous()),
+                                                    Dev(cu_cache), Dev(sel_u), Dev(torch.tensor([n_u], dtype=I32)), None,
+                                                    Dev(sinks), d1], p1)
             report("mla_attn bkeys: a row = form 2 over its union as a plain selection (bits)",
                    rc1 == 0 and torch.equal(d1.to_host()[0].view(-1), crd[r].view(-1)))
             # block causality: later block keys changed, earlier rows keep their bits; the changed ones move

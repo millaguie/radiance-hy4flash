@@ -33,6 +33,7 @@ int hy4_dev_idx_score(const RadArgs* a, RadStream s);
 int hy4_dev_idx_select(const RadArgs* a, RadStream s);
 int hy4_dev_attn_sink(const RadArgs* a, RadStream s);
 int hy4_dev_mla_attn(const RadArgs* a, RadStream s);
+int64_t hy4_dev_mla_attn_scratch(const RadArgs* a);
 int hy4_dev_vit_compact(const RadArgs* a, RadStream s);
 int hy4_dev_vit_pos(const RadArgs* a, RadStream s);
 int hy4_dev_vit_newline(const RadArgs* a, RadStream s);
@@ -268,8 +269,10 @@ const RadKernelInfo kDev[] = {
          cHadQ, hy4_dev_had_quant_act_fp8),
     /* attn_paged_sink at head_dim 256 and gqa 1, any page, causal: Hy4's geometry, which libr4d does
      * not serve (h128 gqa 8/16 and page 16 only). Schema from libref/libr4d. */
-    ROWD("hy4_dev_mla_attn", "hy4_mla_attn", "attn", "Hy4 latent attention with sink, a block a (row, head), card",
-         cMlaAttn, hy4_dev_mla_attn),
+    /* scratch: form 2g's slice partials (dev_attn.hip, mla_attn2g_k) */
+    { "hy4_dev_mla_attn", "hy4_mla_attn", "attn", "Hy4 latent attention with sink, heads grouped by 16 on WMMA, card",
+      "any in the constraints", "bf16 f32 f16 activations, f32 gains", RAD_DOMAIN_DEVICE, 100, NC(cMlaAttn), nullptr, 0,
+      nullptr, nullptr, nullptr, hy4_dev_mla_attn, hy4_dev_mla_attn_scratch, nullptr, nullptr, nullptr },
     ROWD("hy4_dev_mla_project", "hy4_mla_project", "attn", "absorbed MLA projections, a WMMA tile a block, card",
          cMlaProj, hy4_dev_mla_project),
     /* Vision (dev_vit.hip): the tower and the rotary with M-RoPE. */

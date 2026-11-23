@@ -73,6 +73,7 @@ __device__ inline bool store_at_d(long k, int mode, long src_rows, const void* r
  * leaves the entry to it. The last listed wins on both sides. The search is O(M) a block, strided
  * over the threads, and only a k' whose position falls on the same entry pays the sequence lookup;
  * M is the step's logit rows, a few hundred at most. */
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void ring_store_k(int mode, const void* src, int sk, long src_rs, long src_cs,
                                                          long src_rows, long src_cols, const void* rid, int rit,
                                                          long ris, long M, const void* pos, int pit, long ps,
@@ -80,6 +81,7 @@ __global__ __launch_bounds__(kThreads) void ring_store_k(int mode, const void* s
                                                          const void* sidx, int xit, long sx, int32_t* st,
                                                          long slot_stride, long entry_stride, long word_stride,
                                                          long slots, long ring, int width, int offset, long block) {
+    HY4_CHAIN_BODY {
     const long k = blockIdx.x;
     long r, s, slot, p;
     /* uniform over the block: every thread returns together, before the barrier */
@@ -108,17 +110,20 @@ __global__ __launch_bounds__(kThreads) void ring_store_k(int mode, const void* s
         else w = (c - 1 <= last && c - 1 < src_cols) ? src_word_d(src, sk, s * src_rs + (long)(c - 1) * src_cs) : -1;
         base[(long)(offset + c) * word_stride] = w;
     }
+    } HY4_CHAIN_END
 }
 
 /* One block per destination row: with cu, row r of its sequence; without, sequence r. Every
  * destination row is written: the entry, or `fill` when there is none to read (slot < 0, p0 < 1, a
  * stale entry), and also where the host refuses or writes the fill instead (a row outside cu's
  * spans, a cu that is no partition, a slot outside the state), so dst never keeps old bytes. */
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void ring_load_k(const void* pos, int pit, long ps, long rows, const void* cu,
                                                         int cit, long cs, int S, const void* sidx, int xit, long sx,
                                                         const int32_t* st, long slot_stride, long entry_stride,
                                                         long word_stride, long slots, long ring, int width, int offset,
                                                         int32_t fill, int32_t* dst, long d_rs, long d_cs) {
+    HY4_CHAIN_BODY {
     const long r = blockIdx.x;
     const int32_t* base = nullptr;
     long s = r, r0 = r;
@@ -136,6 +141,7 @@ __global__ __launch_bounds__(kThreads) void ring_load_k(const void* pos, int pit
     }
     for (int c = threadIdx.x; c < width; c += kThreads)
         dst[r * d_rs + (long)c * d_cs] = base ? base[(long)(offset + c) * word_stride] : fill;
+    } HY4_CHAIN_END
 }
 
 }  // namespace
@@ -175,7 +181,7 @@ int hy4_dev_ring_store(const RadArgs* a, RadStream stream) {
     if (M < 1 || rows < 1 || (cap > 0 && S > cap) || sidx.shape[0] < S) return RAD_E_SHAPE;
     if (mode == kOut && src->shape[0] < M) return RAD_E_SHAPE;
     const long src_rs = src ? src->stride[0] : 0, src_cs = src && src->rank == 2 ? src->stride[1] : 0;
-    return emit(stream, ring_store_k, dim3((unsigned)M), dim3(kThreads), 0u, mode, src ? src->data : nullptr,
+    return emit(stream, HY4_CHAINED(a, ring_store_k), dim3((unsigned)M), dim3(kThreads), 0u, mode, src ? src->data : nullptr,
                 src ? scode(*src) : 0, src_rs, src_cs, src ? src->shape[0] : 0,
                 src && src->rank == 2 ? src->shape[1] : 1, rid.data, icode(rid), rid.stride[0], (long)M, pos.data,
                 icode(pos), pos.stride[0], rows, cu.data, icode(cu), cu.stride[0], (int)S, sidx.data, icode(sidx),
@@ -200,7 +206,7 @@ int hy4_dev_ring_load(const RadArgs* a, RadStream stream) {
     const int64_t S = cu ? cu->shape[0] - 1 : rows;
     const int64_t n_dst = cu ? rows : S;
     if (rows < 1 || (cap > 0 && S > cap) || sidx.shape[0] < S || dst.shape[0] < n_dst) return RAD_E_SHAPE;
-    return emit(stream, ring_load_k, dim3((unsigned)n_dst), dim3(kThreads), 0u, pos.data, icode(pos), pos.stride[0],
+    return emit(stream, HY4_CHAINED(a, ring_load_k), dim3((unsigned)n_dst), dim3(kThreads), 0u, pos.data, icode(pos), pos.stride[0],
                 rows, cu ? cu->data : nullptr, cu ? icode(*cu) : 0, cu ? cu->stride[0] : 0, (int)S, sidx.data,
                 icode(sidx), sidx.stride[0], (const int32_t*)state.data, v.slot_stride, v.entry_stride,
                 v.word_stride, v.slots, ring, (int)width, (int)offset, (int32_t)fill, (int32_t*)dst.data, dst.stride[0],

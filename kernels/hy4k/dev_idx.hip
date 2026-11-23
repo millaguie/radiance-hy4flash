@@ -59,11 +59,13 @@ __device__ inline void rope_pair(float& a, float& b, int i, const InvFreq& inv_t
 }
 
 /* One block of n threads (n ≤ 256) per group: thread o computes output o. */
+template <class Ch>
 __global__ void idx_pool_k(const void* stg, int sdt, long sp, long ss, const float* wv, long wvp, const float* wg,
                            long wgp, const float* ape, long ap, const void* wn, int wnd, long wns, const void* page,
                            int pit, long pgs, const void* bpos, int bit, long bps, long bpc, int mc, void* cache,
                            int cdt, long cp,
                            long pages, int n, int ratio, int rd, InvFreq inv_t, float eps) {
+    HY4_CHAIN_BODY {
     __shared__ float k[16 * 256];
     __shared__ float red[8];
     __shared__ float out[256];
@@ -76,7 +78,7 @@ __global__ void idx_pool_k(const void* stg, int sdt, long sp, long ss, const flo
     const int o = threadIdx.x;
     for (int j = 0; j < ratio; ++j)
         if (o < n) k[j * n + o] = dld(stg, sdt, (b * ratio + j) * sp + (long)o * ss);
-    __syncthreads();
+    lds_barrier();
     float val = 0;
     if (o < n) {
         float vv[16], gg[16], mx = -INFINITY;
@@ -102,7 +104,7 @@ __global__ void idx_pool_k(const void* stg, int sdt, long sp, long ss, const flo
     float sq = o < n ? val * val : 0.0f;
     for (int d = 16; d; d >>= 1) sq += __shfl_xor(sq, d, 32);
     if ((o & 31) == 0) red[o >> 5] = sq;
-    __syncthreads();
+    lds_barrier();
     float tot = 0;
     for (int i = 0; i < (int)(blockDim.x + 31) / 32; ++i) tot += red[i];
     const float inv = 1.0f / sqrtf(tot / (float)n + eps);
@@ -111,7 +113,7 @@ __global__ void idx_pool_k(const void* stg, int sdt, long sp, long ss, const flo
         dst(cache, cdt, pg * cp + o, val * inv * dld(wn, wnd, (long)o * wns));
         out[o] = dld(cache, cdt, pg * cp + o);
     }
-    __syncthreads();
+    lds_barrier();
     const int off = n - rd, half = rd / 2;
     if (o < half) {
         float a = out[off + 2 * o], c = out[off + 2 * o + 1];
@@ -119,11 +121,13 @@ __global__ void idx_pool_k(const void* stg, int sdt, long sp, long ss, const flo
         out[off + 2 * o] = a;
         out[off + 2 * o + 1] = c;
     }
-    __syncthreads();
+    lds_barrier();
     if (o < n) dst(cache, cdt, pg * cp + o, out[o]);
+    } HY4_CHAIN_END
 }
 
 /* One 256-thread block per row: rotated q into LDS, then one group per thread. */
+template <class Ch>
 __global__ __launch_bounds__(256) void idx_score_k(const void* q, int qdt, long qp, long qh, long qs, const void* w,
                                                    int wdt, long wp, long wsc, const void* pos, int pit, long ps,
                                                    long ps1, int mcv,
@@ -132,6 +136,7 @@ __global__ __launch_bounds__(256) void idx_score_k(const void* q, int qdt, long 
                                                    int S, const void* nc, int nit, long ns, float* score, long scp,
                                                    long scs, int blocks, int n, int H, int rd, InvFreq inv_t, float esc,
                                                    int rows) {
+    HY4_CHAIN_BODY {
     /* mcv: bit 0, 3-D positions; bit 1, 8-wide bf16 key loads. One int because the kernel's
      * arguments, hidden ones included, may not exceed the backend's 768 bytes (tools/kernarg.sh). */
     const int mc = mcv & 1, vec = mcv >> 1;
@@ -150,7 +155,7 @@ __global__ __launch_bounds__(256) void idx_score_k(const void* q, int qdt, long 
         qq[i] = dld(q, qdt, r * qp + (long)h * qh + (long)c * qs);
     }
     if (threadIdx.x < H) wh[threadIdx.x] = dld(w, wdt, r * wp + (long)threadIdx.x * wsc);
-    __syncthreads();
+    lds_barrier();
     long p3[3];
     for (int c = 0; c < 3; ++c) p3[c] = mc ? dldi(pos, pit, (long)c * ps + r * ps1) : dldi(pos, pit, r * ps);
     const int half = rd / 2, off = n - rd;
@@ -161,10 +166,10 @@ __global__ __launch_bounds__(256) void idx_score_k(const void* q, int qdt, long 
         qq[h * n + off + 2 * j] = a;
         qq[h * n + off + 2 * j + 1] = b;
     }
-    __syncthreads();
+    lds_barrier();
     if (bf16)
         for (int i = threadIdx.x; i < H * n; i += 256) qq[i] = bf2f(f2bf(qq[i]));
-    __syncthreads();
+    lds_barrier();
     long ncs = dldi(nc, nit, (long)s * ns);
     if (ncs > btw) ncs = btw;
     /* Each key group is read once and the H heads accumulate together: the old loop read the group
@@ -257,6 +262,7 @@ __global__ __launch_bounds__(256) void idx_score_k(const void* q, int qdt, long 
         }
         score[r * scp + (long)g * scs] = val;
     }
+    } HY4_CHAIN_END
 }
 
 /* Sortable key of a float (larger float, larger key); -0 and +0 share one. */
@@ -269,12 +275,14 @@ __device__ inline uint32_t sort_key(float v) {
 /* One 256-thread block per row. Candidates g < min(nc, pos/ratio, blocks) with page ≥ 0 and a
  * finite score. The best k = topk-1 are picked (higher score; at equal score, lower index), in
  * index order, and the row's own group at the end. */
+template <class Ch>
 __global__ __launch_bounds__(256) void idx_select_k(const float* score, long scp, long scs, const void* bt, int bit,
                                                     long btp, long btw, const void* nc, int nit, long ns,
                                                     const void* pos, int pit, long ps, const void* cu, int cit,
                                                     long cs, int S, void* sel, int sit, long slp, long sls,
                                                     void* nsel, int nsit, long nss, void* used, int uit, long us,
                                                     int blocks, int topk, int ratio, int rows) {
+    HY4_CHAIN_BODY {
     __shared__ uint32_t cnt[256];
     __shared__ uint32_t thresh_s;
     __shared__ int pre_gt[257], pre_eq[257];
@@ -305,10 +313,10 @@ __global__ __launch_bounds__(256) void idx_select_k(const float* score, long scp
     uint32_t nv = 0;
     for (long g = t; g < nca; g += 256) { uint32_t k; nv += valid(g, &k); }
     cnt[t] = nv;
-    __syncthreads();
-    for (int d = 128; d; d >>= 1) { if (t < d) cnt[t] += cnt[t + d]; __syncthreads(); }
+    lds_barrier();
+    for (int d = 128; d; d >>= 1) { if (t < d) cnt[t] += cnt[t + d]; lds_barrier(); }
     const uint32_t total = cnt[0];
-    __syncthreads();
+    lds_barrier();
     /* threshold: the largest key T with #(key ≥ T) ≥ K; with fewer than K valid, all (T = 0) */
     uint32_t T = 0;
     if (total > (uint32_t)K) {
@@ -317,14 +325,14 @@ __global__ __launch_bounds__(256) void idx_select_k(const float* score, long scp
             uint32_t c = 0;
             for (long g = t; g < nca; g += 256) { uint32_t k; if (valid(g, &k) && k >= cand) ++c; }
             cnt[t] = c;
-            __syncthreads();
-            for (int d = 128; d; d >>= 1) { if (t < d) cnt[t] += cnt[t + d]; __syncthreads(); }
+            lds_barrier();
+            for (int d = 128; d; d >>= 1) { if (t < d) cnt[t] += cnt[t + d]; lds_barrier(); }
             if (cnt[0] >= (uint32_t)K) T = cand;
-            __syncthreads();
+            lds_barrier();
         }
     }
     if (t == 0) thresh_s = T;
-    __syncthreads();
+    lds_barrier();
     T = thresh_s;
     /* Contiguous slices per thread, to write in index order. */
     const long span = (nca + 255) / 256, g0 = t * span, g1 = g0 + span < nca ? g0 + span : nca;
@@ -336,10 +344,10 @@ __global__ __launch_bounds__(256) void idx_select_k(const float* score, long scp
     pre_gt[t + 1] = ngt;
     pre_eq[t + 1] = neq;
     if (t == 0) { pre_gt[0] = 0; pre_eq[0] = 0; }
-    __syncthreads();
+    lds_barrier();
     if (t == 0)
         for (int i = 1; i <= 256; ++i) { pre_gt[i] += pre_gt[i - 1]; pre_eq[i] += pre_eq[i - 1]; }
-    __syncthreads();
+    lds_barrier();
     const int tot_gt = pre_gt[256], tot_eq = pre_eq[256];
     /* with total ≤ K all get in: T = 0 and every valid one is > 0 or == 0 */
     const int eq_quota = total > (uint32_t)K ? K - tot_gt : tot_eq;
@@ -361,6 +369,7 @@ __global__ __launch_bounds__(256) void idx_select_k(const float* score, long scp
         dsti(used, uit, r * us, (long)chosen * ratio + (p >= 0 ? p % ratio : 0) + 1);
     }
     for (int i = chosen + 1 + t; i < topk; i += 256) dsti(sel, sit, r * slp + (long)i * sls, -1);
+    } HY4_CHAIN_END
 }
 
 }  // namespace
@@ -393,7 +402,7 @@ int hy4_dev_idx_pool(const RadArgs* a, RadStream s) {
     const int64_t M = page.shape[0];
     if (M < 1 || bpos.shape[0] != M || stg.shape[0] < M * ratio) return RAD_E_SHAPE;
     const unsigned threads = (unsigned)((n + 31) / 32 * 32);
-    return emit(s, idx_pool_k, dim3((unsigned)M), dim3(threads), 0u, stg.data, dcode(stg), stg.stride[0],
+    return emit(s, HY4_CHAINED(a, idx_pool_k), dim3((unsigned)M), dim3(threads), 0u, stg.data, dcode(stg), stg.stride[0],
                  stg.stride[1], (const float*)wv.data, wv.stride[0], (const float*)wg.data, wg.stride[0],
                  (const float*)ape.data, ape.stride[0], wn.data, dcode(wn), wn.stride[0], page.data, icode(page),
                  page.stride[0], bpos.data, icode(bpos), bpos.stride[0], mc ? bpos.stride[1] : 0, mc, cache.data,
@@ -430,7 +439,7 @@ int hy4_dev_idx_score(const RadArgs* a, RadStream s) {
     const int vec = cache.dtype == RAD_BF16 && n % 8 == 0 && cache.stride[0] % 8 == 0 &&
                     ((uintptr_t)cache.data & 15u) == 0 && cache.stride[cache.rank - 1] == 1;
     const unsigned gy = M >= 64 ? 1u : (unsigned)std::min<int64_t>(16, std::max<int64_t>(1, (blocks + 255) / 256));
-    return emit(s, idx_score_k, dim3((unsigned)M, gy), dim3(256), 0u, q.data, dcode(q), q.stride[0], qh, qs, w.data,
+    return emit(s, HY4_CHAINED(a, idx_score_k), dim3((unsigned)M, gy), dim3(256), 0u, q.data, dcode(q), q.stride[0], qh, qs, w.data,
                  dcode(w), w.stride[0], w.stride[1], pos.data, icode(pos), pos.stride[0], mc ? pos.stride[1] : 0, (int)(mc | (vec << 1)),
                  cache.data, dcode(cache),
                  cache.stride[0], cache.shape[0], bt.data, icode(bt), bt.stride[0], bt.shape[1], cu.data, icode(cu),
@@ -454,7 +463,7 @@ int hy4_dev_idx_select(const RadArgs* a, RadStream s) {
         return RAD_E_SHAPE;
     const int64_t S = cu.shape[0] - 1;
     if (S < 1 || bt.shape[0] < S || nc.shape[0] < S) return RAD_E_SHAPE;
-    return emit(s, idx_select_k, dim3((unsigned)M), dim3(256), 0u, (const float*)score.data, score.stride[0],
+    return emit(s, HY4_CHAINED(a, idx_select_k), dim3((unsigned)M), dim3(256), 0u, (const float*)score.data, score.stride[0],
                  score.stride[1], bt.data, icode(bt), bt.stride[0], bt.shape[1], nc.data, icode(nc), nc.stride[0],
                  pos.data, icode(pos), pos.stride[0], cu.data, icode(cu), cu.stride[0], (int)S, sel.data, icode(sel),
                  sel.stride[0], sel.stride[1], nsel.data, icode(nsel), nsel.stride[0], used.data, icode(used),

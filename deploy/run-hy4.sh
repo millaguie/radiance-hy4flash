@@ -23,6 +23,9 @@
 # between the two needs a container converted with HY4_MLA=both (what convert-hip.sh does).
 # RADIANCE_CALIB_* (GPTQ calibration, deploy/calib-batches.sh) pass through unchanged, and so does
 # RADIANCE_AQL_CHAIN_FENCE (2.2.0: 1 keeps the packet processor's acquire on chained launches).
+# HY4K_CONCURRENT=0 and HY4K_CHAIN=0 withdraw hy4k's concurrent and chained launches (comparisons).
+# HY4K_CHAIN_ROWS=N chains hy4k launches of steps up to N rows (default 64).
+# HY4_MLA_PROJ=old serves hy4_mla_project with mla_proj_k instead of the wide form (comparisons).
 set -eu
 CARDS=${1:-0,1}; DUMP=${2:-${HY4_DUMP_DIR:-}}; CFG=${CFG:-hy4.yaml}
 IMAGE=${HY4_IMAGE:-stilldeadcode/radiance:2.2.0}
@@ -48,7 +51,7 @@ VID=$(getent group video | cut -d: -f3); RID=$(getent group render | cut -d: -f3
 docker rm -f hy4-test 2>/dev/null || true
 docker run -d --name hy4-test --network host --init --ulimit memlock=-1 \
   --device /dev/kfd --device /dev/dri --group-add "$RID" --group-add "$VID" \
-  --security-opt seccomp=unconfined -e ROCR_VISIBLE_DEVICES=$CARDS -e HY4_MLA -e HY4_MLA_ATTN -e HY4_CHAIN -e HY4_DFLY \
+  --security-opt seccomp=unconfined -e ROCR_VISIBLE_DEVICES=$CARDS -e HY4_MLA -e HY4_MLA_ATTN -e HY4_CHAIN -e HY4K_CONCURRENT -e HY4K_CHAIN -e HY4K_CHAIN_ROWS -e HY4_MLA_PROJ -e HY4_DFLY -e HY4_SPAN_PLANE \
   -e RADIANCE_CALIB_DIR -e RADIANCE_CALIB_LAYERS -e RADIANCE_CALIB_TOKENS -e RADIANCE_AQL_CHAIN_FENCE \
   -e HY4_DUMP_DIR=$DUMP -e HY4_DUMP_LAYERS=${HY4_DUMP_LAYERS:-0,1,2} \
   -v "$DIR":/hy4 -v "$MODELS":/models:ro \

@@ -416,6 +416,14 @@ struct Model {
     int32_t* win_cu_h = nullptr;
     bool win_cu_tried = false;
     int64_t max_work = 0, plane_rows = 0, max_groups = 0, sel_rows = 0;
+    /* Prefill span pass: Code000, radiance e4541c70 (qwen4exp_fp8's piece_rows, span_on and
+     * pass_step). `piece_rows` is one routed pass without a span, 2048 rows or the step if it is
+     * shorter. `span_on`: the deployment plans a step wider than a piece, which is then a single
+     * sequence (--prefill-span, RadBuildCtx::max_mixed_tok). `pass_step`: --prefill-span-pass
+     * step, so the routed block's pass is the whole step up to 65536 slot rows (`pass_cap` in
+     * declare) and each expert's weight is read once a pass. A sizing declare takes both from the real one. */
+    int64_t piece_rows = 0;
+    bool span_on = false, pass_step = false;
     /* Engram */
     rad_buf eids = 0;              /* [E·T, heads] i32, host, PERSIST */
     int64_t max_spec = 0;          /* drafts a verify step may carry (RadBuildCtx::max_spec) */
@@ -2007,7 +2015,38 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     mc.swiglu_limit = f.swiglu_limit;
     mc.router_k = n;
     mc.no_reduce = 1;
-    mc.rows = std::min<int64_t>(T, 2048);
+    /* Prefill span pass: Code000, radiance e4541c70. Without --prefill-span-pass step a routed
+     * pass is 2048 rows, as it always was here, and a wider step takes several (MoeFP8::step_rows).
+     * With it, on a deployment that spans, the pass is the whole step: this plugin runs every step
+     * serially (it pipelines nothing; the routed arm's all-reduce is its own, over the step's
+     * rows), so nothing needs the pass to be a piece. The pass then reads each expert's weight and
+     * sorts the slots once a step (the PCIe sweep of the pooled experts is already once a step,
+     * whatever the passes). A calibration run keeps its pieces: its statistics are taken a pass
+     * at a time. Not bit-identical to 2048-row passes (an expert's longer run moves rows between
+     * the grouped GEMM's short-run and tiled paths); deterministic. */
+    m.piece_rows = std::min<int64_t>(T, 2048);
+    if (ctx->shape_probe) {
+        m.span_on = g_model[rad_build_slot(ctx)].span_on;
+        m.pass_step = g_model[rad_build_slot(ctx)].pass_step;
+    } else {
+        m.span_on = ctx->max_mixed_tok > 0 && ctx->max_mixed_tok < T && T > m.piece_rows;
+        m.pass_step = ctx->span_pass_step != 0 && m.span_on && !calib_dir();
+        if (ctx->span_pass_step != 0 && !m.pass_step && g.rank == 0)
+            rad_note(b, "--prefill-span-pass step: the routed pass stays 2048 rows (%s)",
+                     !m.span_on ? "this deployment has no step wider than that"
+                                : "a calibration run takes its statistics a pass at a time");
+    }
+    /* The step pass is capped at 65536 slot rows (4096 tokens at top-16), the tallest pass run on
+     * the cards: span 2's. A wider step (span 3 or 4) takes passes that tall, so the slot-row
+     * planes and the routed ops' declared ranges stay where they were validated on every step,
+     * decode included. The first span-4 run with an 8192-token pass (131072 slot rows) hung in
+     * decode in libr4d's chained moe_down_dec_kernel; whether that range was the cause is not
+     * known. A deployment without a span, and span 2, declare what they did before the cap. */
+    const int64_t pass_cap = std::max<int64_t>(m.piece_rows, 65536 / std::max<int64_t>(f.top_k, 1));
+    mc.rows = m.pass_step ? std::min(T, pass_cap) : m.piece_rows;
+    if (m.pass_step && T > pass_cap && !ctx->shape_probe && g.rank == 0)
+        rad_note(b, "--prefill-span-pass step: a %lld-token step takes routed passes of %lld tokens "
+                    "(65536 expert-slot rows, the tallest pass validated)", (long long)T, (long long)pass_cap);
     m.msrc.resize((size_t)f.n_layer);
     for (int l = 0; l < (int)f.n_layer; ++l) {
         if (!f.moe[(size_t)l]) continue;
@@ -2041,7 +2080,19 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.plane_rows = T;
     /* With images the score reads the step's 3-D positions whole (RadBatch::rope_pos cannot be
      * chunked by windows): the plane covers the step. */
-    if (!m.media && T > 1024 && ctx->max_mixed_tok > 0 && ctx->max_mixed_tok <= 1024) m.plane_rows = 1024;
+    const bool win1024 = !m.media && T > 1024 && ctx->max_mixed_tok > 0 && ctx->max_mixed_tok <= 1024;
+    if (win1024) m.plane_rows = 1024;
+    /* Prefill span pass: Code000, radiance e4541c70 (qwen4exp_fp8's qsa_rows). Under a span whose
+     * shared budget is a piece, the plane stays a piece tall and the spanned step, a single
+     * sequence, is scored in windows: the plane is the one buffer whose size is the product of two
+     * deployment bounds (at 196K of context 384 MiB a rank for every 2048 rows), and a window
+     * writes each row the bytes the whole plane would. HY4_SPAN_PLANE=step grows it back to the
+     * step after either rule (one score launch a step; for measuring). */
+    else if (!m.media && m.span_on && ctx->max_mixed_tok <= m.piece_rows) m.plane_rows = m.piece_rows;
+    if (m.plane_rows < T) {
+        const char* sp = std::getenv("HY4_SPAN_PLANE");
+        if (sp && !std::strcmp(sp, "step")) m.plane_rows = T;
+    }
     /* The plane's limit, as in qwen4exp (512 Mi f32 elements, 2 GiB). */
     if (m.plane_rows * m.max_groups > (int64_t)512 << 20) {
         std::fprintf(stderr, "radiance: hyv4flash: the score plane [%lld, %lld] exceeds 512 Mi elements: lower "
@@ -2138,7 +2189,9 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
     m.logits = decl_b(b, nm.f("logits"), RAD_F32, { g.max_logit_rows, g.n_vocab });
     HY_TRY(rad_declare_logits(b, m.logits));
     {
-        const int64_t rows_moe = std::min<int64_t>(T, 2048), S = rows_moe * f.top_k;
+        /* A pass's sorted planes: a row per (token, expert slot) of one pass, so a step tall under
+         * --prefill-span-pass step (prefill span pass: Code000, radiance e4541c70). */
+        const int64_t rows_moe = mc.rows, S = rows_moe * f.top_k;
         m.mw.logits = decl_b(b, nm.f("moe_logits"), RAD_F32, { T, f.n_expert });
         m.mw.ids = decl_b(b, nm.f("moe_ids"), RAD_I32, { T, f.top_k });
         m.mw.ew = decl_b(b, nm.f("moe_weights"), RAD_F32, { T, f.top_k });
@@ -2353,8 +2406,19 @@ static void step_mla(RadCtx* c, const RadBatch* batch, const Model& m, const Mla
         RAD_ISSUE(c, at.op_kv_norm, bcol(m.kva, 0, L, T), RAD_W(at.w_kv_norm), bcol(m.kva, 0, L, T));
         RAD_ISSUE(c, at.op_rope_q, bcol(B.q, 0, H * qk, T), rope_posmc(g, batch, T));
         RAD_ISSUE(c, at.op_rope_k, bcol(m.kva, L, f.rope, T), rope_posmc(g, batch, T));
-        RAD_ISSUE(c, T > 32 ? at.op_absorb_m : at.op_absorb, bcol(B.q, 0, H * qk, T), RAD_W(at.w_kvb_abs),
-                  bcol(B.qlat, 0, H * L, T));
+        /* A step over 2048 rows projects in pieces of 2048 (a spanned step, or any step of a larger
+         * max-num-batched-tokens without a span): hy4_mla_project is per row, so the bytes are one
+         * launch's, but one launch over 4096 rows measured 3.7 times one over 2048 (profile at 18K,
+         * 2026-11-22), which made the span slower than none. Up to 2048 rows: one launch, as before. */
+        if (T <= m.piece_rows)
+            RAD_ISSUE(c, T > 32 ? at.op_absorb_m : at.op_absorb, bcol(B.q, 0, H * qk, T), RAD_W(at.w_kvb_abs),
+                      bcol(B.qlat, 0, H * L, T));
+        else
+            for (int64_t o = 0; o < T; o += m.piece_rows) {
+                const int64_t nr = std::min(m.piece_rows, T - o);
+                RAD_ISSUE(c, at.op_absorb_m, bcol_at(B.q, o, H * qk, 0, H * qk, nr), RAD_W(at.w_kvb_abs),
+                          bcol_at(B.qlat, o, H * L, 0, H * L, nr));
+            }
         RAD_ISSUE(c, at.op_store, bcol(m.kva, 0, lat_hd, T), bcol(m.kva, lat_hd, lat_hd, T),
                   praw(kvb ? kvb->slot_mapping : nullptr, RAD_I32, T), kv_cache(at.kv, at.layer));
     } else {
@@ -2413,10 +2477,17 @@ static void step_mla(RadCtx* c, const RadBatch* batch, const Model& m, const Mla
                 /* q's rope at the rotary position: 3-D with images (plane covers the step: w0 = 0) */
                 const RadOperand qpos = mc && w0 == 0 && R == T ? praw2(batch->rope_pos, RAD_I32, 3, T)
                                                                 : praw(batch->positions + w0, RAD_I32, R);
+                /* A window's rows end at w0 + R, so they have no closed group past that: the same
+                 * bound as `live` with the window's end for the step's (the whole step when the
+                 * plane covers it). A spanned step's first windows then score only their own
+                 * history, not the groups the later windows close. The select reads columns below a
+                 * row's own group (idx_select_k), so the selection is the same. */
+                const int64_t lw = std::min<int64_t>(live, ((int64_t)batch->max_ctx_len + w0 + R + f.idx_ratio) /
+                                                               f.idx_ratio + 1);
                 RAD_ISSUE_N(c, at.op_score, R, brow_slice(m.iq, w0, R, iqw), brow_slice(m.ihw, w0, R, f.idx_heads),
                             qpos, kv_cache(m.kv_idx, at.layer), bt_keys, cu,
-                            brows(m.nc, S), bcol_at(m.score, 0, m.max_groups, 0, live, R));
-                RAD_ISSUE_N(c, at.op_select, R, bcol_at(m.score, 0, m.max_groups, 0, live, R), bt_attn, brows(m.nc, S),
+                            brows(m.nc, S), bcol_at(m.score, 0, m.max_groups, 0, lw, R));
+                RAD_ISSUE_N(c, at.op_select, R, bcol_at(m.score, 0, m.max_groups, 0, lw, R), bt_attn, brows(m.nc, S),
                             praw(batch->positions + w0, RAD_I32, R), cu, brow_slice(m.sel, w0, R, K),
                             brow_slice(m.nsel, w0, R, 1), brow_slice(m.sequ, w0, R, 1));
             };
@@ -2476,9 +2547,15 @@ static void step_mla(RadCtx* c, const RadBatch* batch, const Model& m, const Mla
                     praw(kvb ? kvb->seqused : nullptr, RAD_I32, S), RAD_NONE, RAD_NONE,
                     praw(batch->cu_seqlens, RAD_I32, S + 1), RAD_W(at.w_sink), bcol(B.o.x, 0, H * f.v_dim, T));
     }
-    if (m.mla_abs)
+    if (m.mla_abs && T <= m.piece_rows)
         RAD_ISSUE(c, T > 32 ? at.op_expand_m : at.op_expand, bcol(B.olat, 0, H * L, T), RAD_W(at.w_kvb_abs),
                   bcol(B.o.x, 0, H * f.v_dim, T));
+    else if (m.mla_abs)   /* in pieces, as the absorb above */
+        for (int64_t o = 0; o < T; o += m.piece_rows) {
+            const int64_t nr = std::min(m.piece_rows, T - o);
+            RAD_ISSUE(c, at.op_expand_m, bcol_at(B.olat, o, H * L, 0, H * L, nr), RAD_W(at.w_kvb_abs),
+                      bcol_at(B.o.x, o, H * f.v_dim, 0, H * f.v_dim, nr));
+        }
     at.gate.step(c, m.a, B.gt, T);
     if (at.op_gq) {
         /* a row a (token, head): M is T * H, the operands the whole [T, H * v_dim] planes */

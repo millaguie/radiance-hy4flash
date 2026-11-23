@@ -370,6 +370,17 @@ rounding at the output; only the order of the reductions changes. What they do d
 - **inv_freq of the indexer's rope.** The host computes it the same way as the oracle (`std::pow` in
   float) and passes it to the kernel by value: the card's `powf` is 1-2 ulp off, and the phase
   `p·inv_freq` multiplies that by the position.
+- **Barriers.** Since 2026-11-22 every barrier that only orders LDS traffic is libr4d's `lds_barrier()`
+  (`dev_common.h`, from radiance's `r4d_common.h`): a workgroup fence on the local address space and
+  `s_barrier`, where `__syncthreads()` also fences global memory and on gfx12 emits a `global_inv`
+  on both sides, throwing away the L0 lines the next loads would hit. No hy4k kernel reads global
+  memory that another thread of its block wrote, so all of them qualify (attention forms 1-3 and 2g,
+  `hc_pre*`, Engram's `rows_rmsnorm_k` and `engram_gate_k`, the indexer's pool, score and select,
+  `block_sum`); the code objects went from one `global_inv` per barrier pair to none. The one left is
+  `ring_store_k`'s `__syncthreads_or`, a reduction. The arithmetic is unchanged, so the bits are the
+  same: the KL (`perf-kl-22.yaml`) is final-22's at all 10851 positions, scored in 32-row steps it is
+  the 2.2 plugins' own 32-row run bit for bit, and the greedy texts are the 2.2 plugins' bytes, with
+  and without DFly2.
 - **`constraints`.** Each row declares its band (`schemas.cpp`), chosen so that every geometry
   inside it is served (for example `hc ≤ 4` and `n ≤ 4096` instead of a limit on the product, which
   constraints cannot express). What is not geometry but operand form (sinks present in the
@@ -394,23 +405,74 @@ correct, not fast.
   order: 2.7 ms, but other bits, and on the full model its per-position KL tails left the rounding
   envelope (p99 |dKL| 2.53 against 2.4, 861 top-1 changes against 850, mean 0.1808 -> 0.1793), so it
   is opt-in.
-- **Form 2** (`mla_attn2_k`), up to 32 rows (decode): libr4d's `attend_paged` with the same additions.
-  One 8-wave block per (row, head), each wave a slice of the visible keys (a lane holds 16 latent and
-  2 rope columns, so a score is one wave sum), the slices merged in LDS in a fixed order. The split
-  depends only on the row, so a row gives the same bits alone or in a batch of up to 32
-  (`tests/test_dev.py`). Forms 2 and 3 give different bits for the same row, as libr4d's do.
+- **Form 2g** (`mla_attn2g_k` + `mla_merge_k`, 2026-11-22, **opt-in: `HY4_MLA_ATTN=g`**), up to 32
+  rows (decode, a DFly2 verify) and the drafter's block keys: the heads grouped as in libr4d's `attend_rows` and the history
+  split as in its `attend_paged` + `merge_paged`. One 4-wave block per (row, 16 heads, slice): each
+  16-key tile is loaded once for the 16 heads (form 2 read the row's whole latent cache once per
+  head). S^T = K Q^T on BF16 WMMA with the keys as matrix rows and the heads as columns, so a head is
+  a lane and keeps its softmax state in registers; wave w scores the column quarter 144w..144w+143 of
+  the 576 and the four partial dots are added in LDS in a fixed order; P is split into high and low
+  BF16 halves (as form 3) and wave w accumulates O^T for latent columns 128w..128w+127; the next tile
+  is fetched into registers while the current one is multiplied. Each slice writes f32 partials to
+  the row's scratch (512 values, maximum, denominator, a visible key, a NaN seen; 2064 bytes) and
+  `mla_merge_k` adds them in slice order with the sink and the oracle's special cases. **The slice
+  count depends only on the head count** (256 / heads: 16 at the sparse layers' 16 heads a rank, 8 at
+  the window layers' 32), never on the batch, so a row gives the same bits alone or in any batch of
+  up to 32 rows, and a verify row the decode row's bits at its position (`tests/test_dev.py`; on the
+  full model the greedy texts with and without DFly2 are the same bytes). Its bits differ from the
+  per-head form 2's (another summation order; about 0.2% of the outputs move by one BF16 rounding on
+  the card test). Scratch, only when it is on: rows (up to 64) x heads x slices x 2064 bytes, 33.8 MB
+  at Hy4's geometry (the engine's scratch is 768 KiB otherwise). Needs heads a multiple of 16 and form
+  3's q_rope alignment; otherwise, and without the scratch, the per-head form 2 serves the call. On
+  gfx11 the slices run form 2's per-key arithmetic, four heads a wave.
+
+  **Why opt-in.** The standard KL never reaches it (2048-row chunks run form 3: bit for bit
+  final-22). Scored in 32-row steps (`max-num-batched-tokens: 32`, so every attention row runs a
+  decode form), its p99 |dKL| against final-22 sat just past the envelope's 2.4 in all three legal
+  samples (16, 8 and 32 slices at the sparse layers), while the per-head form's own legal reorders
+  (8, 4 and 16 waves) straddled it; mean, p50 and top-1 changes were inside for both:
+
+  | 32-row steps against final-22 | mean | p50 \|dKL\| | p99 | top-1 changes |
+  |---|---|---|---|---|
+  | per-head form 2, 8 / 4 / 16 waves | 0.1796 / 0.1884 / 0.1875 | 7.79 / 7.98 / 8.39e-3 | 2.26 / 2.29 / 2.49 | 791 / 813 / 790 |
+  | form 2g, 16 / 8 / 32 slices | 0.1870 / 0.1861 / 0.1897 | 7.58 / 7.49 / 8.03e-3 | 2.52 / 2.43 / 2.62 | 816 / 811 / 835 |
+
+  The 32-row regime itself is at the envelope's edge (the envelope was measured in 2048-row chunks),
+  and form 2g's tail is about 0.15 higher in p99 than the per-head form's. It stays opt-in, like
+  `HY4_MLA_ATTN=4`, until a BFCL run or an envelope measured in 32-row steps says otherwise. Decode
+  speed with it: `docs/PERF-OPTIONS-2026-11-21.md`. On one R9700 (`tests/bench_attn.py --decode`, 330 W, a
+  call in a loop of 200 with the host launch included):
+
+  | rows | 16 heads, 2048-key selection: form 2 → 2g | 32 heads, window 512: form 2 → 2g |
+  |---|---|---|
+  | 1 | 152 → 42 µs | 40 → 26 µs |
+  | 4 | 153 → 43 µs | 97 → 30 µs |
+  | 8 | 261 → 84 µs | 151 → 48 µs |
+  | 32 | 852 → 216 µs | 425 → 130 µs |
+
+  Slice counts from 4 to 32 were timed too: 256 / heads is the best or within 15% of it at every row
+  count; 32 slices gain 5 µs at one sparse row and lose at 4 rows and up.
+- **Form 2** (`mla_attn2_k`), the per-head form, now the fallback of form 2g: libr4d's `attend_paged`
+  with the same additions. One 8-wave block per (row, head), each wave a slice of the visible keys (a
+  lane holds 16 latent and 2 rope columns, so a score is one wave sum), the slices merged in LDS in a
+  fixed order. The split depends only on the row, so a row gives the same bits alone or in a batch of
+  up to 32. Forms 2, 2g and 3 give different bits for the same row, as libr4d's do.
 - **Form 1** (`mla_attn_k`): everything else (f32, f16, other widths, unaligned views). One
   256-thread block per (row, head) over 32-key strips, as `attn_paged_sink`.
 
-`HY4_MLA_ATTN=1` forces form 1 and `=2` form 2, to compare them. In forms 2 and 3 a -inf score weighs
-0 and a NaN reaches the output, as in the oracle.
+`HY4_MLA_ATTN=1` forces form 1, `=2` the per-head form 2 at every row count, `=g` turns form 2g on,
+`=h` (or unset) serves the default forms: form 3 above 32 rows, the per-head form 2 below and for
+block keys. The parameters `mla_form` (6 form 2g on, 5 off) and `mla_splits` (the slice count), which
+the graph never passes, do the same per call for `tests/test_dev.py` and `tests/bench_attn.py`. In forms 2, 2g and 3 a
+-inf score weighs 0 and a NaN reaches the output, as in the oracle.
 
-With block keys (`bkeys`, `bcu`) the launcher runs form 2 whatever the row count (`mla_attn2_k<true>`):
-the drafter's rows are few and need no batch invariance across forms. The slices split the union, the
-row's cached keys first and then its block keys, so a row gives the same bits as form 2 over the same
-keys laid out as a plain selection, and the same bits alone as in a batch (`tests/test_dev.py`). The
-instance without block keys (`mla_attn2_k<false>`) is the form 2 of before: an old and a new build give
-the same output bytes in forms 1, 2 and 3. Block keys need form 2's geometry (bf16, `bkeys` with
+With block keys (`bkeys`, `bcu`) the launcher runs form 2 whatever the row count (`mla_attn2_k<true>`,
+or with form 2g on `mla_attn2g_k<true>` up to 64 rows): the drafter's rows are few and need no batch
+invariance across forms. The slices split the union, the row's cached keys first and then its block
+keys, so a row gives the same bits as the same form over the same keys laid out as a plain
+selection, and the same bits alone as in a batch (`tests/test_dev.py`, in both forms). The per-head
+instance without block keys (`mla_attn2_k<false>`) is the form 2 of before: by default an old and a
+new build give the same output bytes in forms 1, 2 and 3. Block keys need form 2's geometry (bf16, `bkeys` with
 contiguous columns, rows a multiple of 8 values, 16-byte aligned); the card row refuses them with
 `RAD_E_INVAL` anywhere else, and under `HY4_MLA_ATTN=1`. The host row serves them in every dtype.
 

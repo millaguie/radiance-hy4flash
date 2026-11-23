@@ -1,8 +1,8 @@
 # The released container on two 32 GB cards (2x Radeon AI PRO R9700, 64 GB of host RAM): GPTQ 4-bit
 # experts tiered between VRAM and a pinned host pool, IQ8R trunk, the DFly2 drafter with the adaptive
 # window, the Engram tables read from the drive. radiance 2.2.0 with the plugins of this repository
-# in /hy4/home (README.md, "How to run it"). With DFly2 and several clients on 2.2.0, start the
-# server with RADIANCE_AQL_CHAIN_FENCE=1 (docs/DESIGN.md, "Moving to radiance 2.2.0").
+# in /hy4/home (README.md, "How to run it"). DFly2 pays off for code and tool calls at one or two
+# clients; for prose or many clients, serve with num-speculative-tokens: 0 (README.md, "Metrics").
 # template-sha256: 3a2f6a781bb416d4d3ead906bedee5e9d91691bd505f27fd35f3e71955d3ad3a
 server:
   host: 127.0.0.1

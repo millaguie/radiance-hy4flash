@@ -11,8 +11,8 @@ This repository includes material from other works:
   arch/common/rad_fp8.h. Copyright 2026 Deadcode and the radiance contributors, licensed under the
   Apache License, Version 2.0. Modification: GateQuantFP8 accepts a rotated E4M3 consumer (`rot`)
   together with the clamp, by writing the clamped product to the bf16 plane and quantising it with
-  `had_quant_act_fp8`; the changed lines are marked "hyv4flash (vendor)" and the file's first
-  comment states the change.
+  `had_quant_act_fp8`, and the clamped step issues its two ops at most 32768 rows a launch; the
+  changed lines are marked "hyv4flash (vendor)" and the file's first comment states the changes.
 
 - data/chat_template.jinja is a modified copy of the chat template of tencent/Hy4-flash
   (https://huggingface.co/tencent/Hy4-flash), by the Tencent Hy Team, licensed under the Tencent Hy
@@ -20,6 +20,19 @@ This repository includes material from other works:
   `~` concatenations, which radiance's Jinja renders; the rendered prompt is the same.
 
 - ref/hy4-config.json is an unmodified copy of that model's config.json, under the same license.
+
+- arch/hyv4flash/hyv4flash.cpp follows, for a prefill step that spans several checkpoint intervals,
+  the span-pass design Code000 wrote for radiance's qwen4exp_fp8 (radiance commits e4541c70,
+  "prefill: one routed MoE pass over a spanned step (prefill-span-pass: step)", and 917d5e4b,
+  "sched: prefill-span-first and prefill-tail-snapshot options"; both in radiance 2.2.0, Apache
+  License, Version 2.0): the routed pass a step tall, the piece-tall score plane scored in
+  windows, and the way a sizing declare takes both from the real one. The lines are marked
+  "Prefill span pass: Code000, radiance e4541c70"; docs/DESIGN.md, "Prefill spans", explains it.
+
+- kernels/hy4k/dev_attn.hip, mla_proj2_k (the wide hy4_mla_project), follows the "Direct-B f16 WMMA
+  prefill" loading scheme of gostar's radiance PR #586 (libr4d/r4d_moe_nvfp4.hip, Apache License,
+  Version 2.0): each wave reads its B fragments with 16-byte loads straight from global memory. The
+  code is new; the kernel's first comment credits the idea.
 
 A copy of the Tencent Hy License, Version 1.0 is in hf/LICENSE. The Hy4-flash model weights are not
 part of this repository; they, and any container converted from them, stay under that license,

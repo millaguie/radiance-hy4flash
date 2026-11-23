@@ -27,8 +27,10 @@ __device__ inline uint8_t e4m3_byte(float v) {
  * registers (like libhalo's halo_fwht_wave): stages 1 and 2 within the lane, 4..64 across lanes
  * with __shfl_xor. Each butterfly puts a+b in the low element and a-b in the high one, the same
  * order as the oracle, so the result is bit-identical. Four waves per block. */
+template <class Ch>
 __global__ __launch_bounds__(128) void had_quant_k(const void* x, int xdt, long xp, long xs, uint8_t* q, long qp,
                                                    long qs, float* s, long sp, long ss, int ngrp) {
+    HY4_CHAIN_BODY {
     const long r = blockIdx.x;
     const int lane = threadIdx.x & 31, g = blockIdx.y * 4 + (threadIdx.x >> 5);
     if (g >= ngrp) return;
@@ -52,6 +54,7 @@ __global__ __launch_bounds__(128) void had_quant_k(const void* x, int xdt, long 
     const float sc = m > 0.0f ? m * (1.0f / 448.0f) : 1.0f, inv = 1.0f / sc;
     if (lane == 0) s[r * sp + (long)g * ss] = sc;
     for (int j = 0; j < 4; ++j) q[r * qp + (c0 + j) * qs] = e4m3_byte(fminf(448.0f, fmaxf(-448.0f, v[j] * inv)));
+    } HY4_CHAIN_END
 }
 
 }  // namespace
@@ -69,7 +72,7 @@ int hy4_dev_had_quant_act_fp8(const RadArgs* a, RadStream st) {
     const int64_t rows = x.shape[0];
     if (rows < 1 || q.shape[0] != rows || s.shape[0] != rows) return RAD_E_SHAPE;
     const int ngrp = (int)(n / 128);
-    return emit(st, had_quant_k, dim3((unsigned)rows, (unsigned)((ngrp + 3) / 4)), dim3(128), 0u, x.data, dcode(x),
+    return emit(st, HY4_CHAINED(a, had_quant_k), dim3((unsigned)rows, (unsigned)((ngrp + 3) / 4)), dim3(128), 0u, x.data, dcode(x),
                  x.stride[0], x.stride[x.rank - 1], (uint8_t*)q.data, q.stride[0], q.stride[q.rank - 1],
                  (float*)s.data, s.stride[0], s.stride[1], ngrp);
 }

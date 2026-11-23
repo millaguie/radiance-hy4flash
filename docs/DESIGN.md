@@ -522,3 +522,305 @@ absorbed). The hy4k device code `build-hip-22` builds is byte for byte `build-hi
   01f08152`). Keeping the acquire (`RADIANCE_AQL_CHAIN_FENCE=1`, which `deploy/run-hy4.sh` passes
   through) brings 8 clients back into 2.1.0's spread (2.1.0 gave 528 in the morning run and 632
   here). Until more runs settle it, a 2.2.0 deployment with DFly2 sets it.
+
+## Prefill spans
+
+The design here is **Code000**'s, a radiance contributor: radiance commits `e4541c70` ("prefill:
+one routed MoE pass over a spanned step (prefill-span-pass: step)") and `917d5e4b` ("sched:
+prefill-span-first and prefill-tail-snapshot options"), both in 2.2.0 and documented in radiance's
+`docs/GUIDE.md` §4.5. The plugin follows what `qwen4exp_fp8` does with it; the lines are marked
+"Prefill span pass: Code000, radiance e4541c70".
+
+**What a span is.** The scheduler cuts a prompt at every checkpoint interval (2048 tokens), so a
+prefill is otherwise one interval a step. With `prefill-span: N` and `max-num-batched-tokens` of N
+intervals, a prefill that is alone in its step carries up to N intervals in one step: the span.
+Every other step (decode rows, several prompts, a request waiting) is planned at the shared budget,
+`max-num-batched-tokens` less the extra intervals, so a step wider than that budget is one sequence
+(`RadBuildCtx::max_mixed_tok`). The checkpoints inside a span are not written. Three more keys
+shape it:
+
+- `prefill-span-first: on` lets the span start at the prompt's first token (off: the first interval
+  is a step of its own). The first interval's rows then go through the indexer's selection with
+  the rest of the step, where a step of their own, within 2048 tokens of context, takes the dense
+  attention; below 2048 tokens the selection holds every group, so they are the same keys.
+- `prefill-span-pass: step` (`RadBuildCtx::span_pass_step`) lets the plugin run the routed MoE of a
+  spanned step in one pass instead of one pass of 2048 rows an interval.
+- `prefill-span-min: N` is the shortest prompt a prefill spans for; `auto` is eight intervals with
+  tiered experts (radiance's `core/engine.cpp`, `Engine::serve`: a spanned step runs at the arena's
+  full plan, which lends the expert slab nothing, so a short prompt loses more than the span
+  gives; the eight intervals are what Flash-Next measured at two ranks) and 0 elsewhere; `0` spans
+  every lone prefill, which is what radiance's guide sets beside the step pass.
+
+**Why it should help a tiered-expert model.** Under `expert_tiered` the experts that are not on
+the card are in the host pool, and a prefill step of more than 1024 tokens brings each routed
+layer's pooled experts over PCIe ahead of the layer that reads them (radiance's prefill stager,
+`core/place/stager.h`). A 2048-token step routes to nearly every expert, so every step is a sweep
+of all the pooled experts of 41 layers (14 GiB a card and step in the measured deployment), the
+same for 2048 rows as for 8192: a step of N intervals is one sweep where N steps were N. The sweep
+is a step's, not a routed pass's, so that part comes from the span itself; the step pass adds that
+each expert's weight is read on the card, and the slots sorted, once a step instead of once an
+interval.
+
+**What the plugin does.** Most of it is in `declare`: `step` already runs every step serially and
+issues the routed arm's all-reduce itself over the step's rows. `step_mla` changes in two places,
+both beyond Code000's design: each score window is bounded by its own end, and the MLA projection
+is issued in 2048-row pieces (the window bound under the score plane below, the pieces last).
+
+- `MoeFP8::Cfg::rows` is the step (`max_tok`), up to 65,536 slot rows (4096 tokens), when the
+  deployment spans and asks for the step pass, and 2048 otherwise, as before; the planes with a row per (token, expert slot)
+  (`moe_sorted`, `moe_gate_up`, `moe_ffn` and its codes, `moe_down`) grow with it. A calibration
+  run keeps 2048-row passes, and startup notes when the key was declined.
+- A sizing declare (`shape_probe`) takes `span_on` and `pass_step` from the real one, as
+  `qwen4exp_fp8` does, so an arena level holds one pass of its own rows.
+- The indexer's score plane (`[plane_rows, max_ctx / 4 + 1]` f32, the only buffer that is the
+  product of two deployment bounds: 384 MiB a rank for every 2048 rows at 196K of context) stays
+  2048 rows under a span whose shared budget (`max_mixed_tok`) is at most 2048 (a larger shared
+  budget keeps the plane the step's height, since a step up to that budget may hold several
+  sequences), and a spanned step is scored in windows, which the plugin already did
+  for a shared budget of 1024. Each row reads its own query and position, so a window writes the
+  bytes the whole plane would. `HY4_SPAN_PLANE=step` grows the plane to the step instead (also over the
+  1024-row rule).
+  Each window scores the columns up to its own end, not the step's (the groups the later windows
+  close are in no row's history; `idx_select_k` reads only columns below a row's own group), which
+  the whole-step bound made every window compute. This last part is beyond Code000's design; span 2's KL rows are bit for bit the
+  rows without it (2026-11-22). The builds in the table below do not have it.
+- libr4d's `swiglu_clamped` refuses 65536 rows or more, and with `top_k` 16 a 4096-token pass is
+  exactly 65536 slot rows (Flash-Next's top-8 never reaches it at the same budget). The vendored
+  `GateQuantFP8::step` issues its two per-row ops, `swiglu_clamped` and `had_quant_act_fp8`, in
+  slices of 32768 rows: the same bytes, and one launch as before for a pass of up to 2048 tokens.
+- `step_mla` issues `hy4_mla_project` (absorb and expand) in 2048-row pieces on any step wider than
+  2048 rows. The gate is the step's width, not the span: a deployment with a larger
+  `max-num-batched-tokens` and no span gets the pieces too. Per row, so the same bytes; the reason
+  is the measurement below.
+
+Without `prefill-span` the declare is the one it was (`max_mixed_tok` and `span_pass_step` are 0):
+the same ops, buffers and arena, and the KL rows are bit for bit the served build's.
+
+**Measured (2026-11-21, 2x R9700 at 330 W, the GPTQ container, tp 2, `expert_tiered`, 196K, 8
+sequences, same session; prefill in tok/s over the time to the first token, median of three):**
+
+| | decode 1 / 4 / 8 | prefill 5.7K | 18K | 73K (each of the three) |
+|---|---|---|---|---|
+| no span, the served build | 57.7 / 196.1 / 341.2 | 3,010 | 2,740 | 2,618, 1,932, 777 (a download was writing to the NVMe) |
+| no span, this build | 57.1 / 198.7 / 338.1 | 3,015 | 2,709 | 2,593, 2,598, 1,603 |
+| `max-num-batched-tokens: 4096`, span 2, first on, step pass, min 0 | 56.6 / 195.6 / 338.3 | 2,714 | 2,391 | 2,307, 2,309, 2,313 |
+
+So on this model the span as configured is **10 to 13 % slower**, not faster: a 4096-token step
+takes about 0.2 s more than two 2048-token steps (1.77 s against 2 x 0.79 s at 73K) although it
+moves half the bytes over the link (15.7 GiB a spanned step against 2 x 13.9 GiB), which says the
+2048-token step is not bound by the link here and something in the wider step costs more a row.
+The per-op profile (`profile-ops`, three 18K prompts, no span against span 2) names it:
+`hy4_mla_project`, this repository's own WMMA projection of the absorbed MLA, took 3,234 ms without
+the span and 6,670 ms with it for the same rows (1.4 ms a launch at 2048 rows, 5.3 ms at 4096: 3.7
+times the time for twice the rows), 3.4 s of the 3.9 s the span lost. Everything else was within
+a few percent, and the routed GEMMs' total did not change (3,599 against 3,593 ms). `step_mla` now
+issues the projection in 2048-row pieces on a step wider than 2048 rows (per row, so the same bytes; a step of
+up to 2048 rows is the one launch it was). Why one launch scales that way was found on
+2026-11-23: `mla_proj_k`'s row-major grid ("The wide mla_project", below).
+
+With the pieces (2026-11-22, build `bbd84d42`, same queue, one run each; KL rows of span 2 and of
+no span bit for bit those of the build before):
+
+| | decode 1 / 4 / 8 | prefill 5.7K (each of three) | 18K | 73K |
+|---|---|---|---|---|
+| no span | 56.8 / 193.2 / 340.0 | 2,500, 3,009, 3,007 | 2,664, 797, 2,708 | 1,249, 947, 1,598 |
+| span 2, first on, step pass, min 0 | 57.6 / 196.2 / 280.6 | 436, 3,018, 3,095 | 2,746, 2,792, 754 | 2,721, 1,211, 1,272 |
+| span 2, first off | 57.6 / 200.1 / 340.2 | 2,878, 3,000, 3,094 | 2,763, 2,824, 2,794 | 2,732, 2,713, 2,713 |
+| span 3, first on | 57.5 / 196.1 / 333.6 | 2,306, 2,413, 2,416 | 2,766, 2,752, 2,740 | 2,635, 1,682, 2,659 |
+| span 4, first on | 57.5 / 195.9 / 338.4 | 2,301, 2,405, 2,358 | 2,686, 2,600, 2,617 | 1,187, 1,665, 1,243 |
+| no span, again at the end | 57.5 / 196.0 / 341.0 | 2,775, 2,942, 3,026 | 2,677, 2,755, 2,769 | 2,623, 2,597, 2,551 |
+
+The span no longer loses. Between the two runs with no disturbed request, span 2 without
+`prefill-span-first` and the closing baseline, the span is 2 % ahead at 5.7K (3,000 against
+2,942), 1.4 % at 18K (2,794 against 2,755) and 4.5 % at 73K (2,713 against 2,597), medians of
+three. With `prefill-span-first` the undisturbed
+requests say the same. Span 3 and 4 are no better at 18K and 73K and lose a fifth at 5.7K (2,400
+against 3,000). The session was noisy (single requests at a quarter of the rate, the NVMe up to
+76 °C at a run's end, 280 tok/s at eight clients once), so these are estimates, in the range
+radiance's guide gives for Flash-Next (+1.4 to +6.7 %). The gain does not pay for the KV pool it
+takes (below): the deployment keeps `max-num-batched-tokens: 2048` and no span; for single long
+prompts span 2 is the one to use, with or without `prefill-span-first`.
+
+**The step pass is capped at 65,536 slot rows** (4096 tokens at top-16: `pass_cap` in `declare`,
+with a startup note when it applies). With `max-num-batched-tokens: 8192` and an uncapped pass,
+span 4 declared and its KL run finished, but its first speed run hung in decode at four clients
+(libr4d's chained `moe_down_dec_kernel` never finished and the server exited on
+`scheduler.stuck-exit`); the second run, on build `bbd84d42`, went through (57.5 / 195.9 / 338.4).
+A suspect, not proven: uncapped, `MoeFP8::Cfg::rows` is `max_tok`, so the slot-row planes and the
+routed ops' declared ranges reach 8192 x 16 = 131,072 rows on every step, decode included, where
+span 2 stays at 65,536 and no span at 32,768. With the cap, span 3 and 4 run 4096-token passes
+and declare the routed block as span 2 does; span 2 and no span declare what they did. The
+capped build (`38f57fe0`) was checked on the cards on 2026-11-22: KL of span 2 bit for bit the
+earlier span-2 rows, KL without a span bit for bit `final-22`, and one span-4 speed run with
+4096-token passes without a hang (decode 57.3 / 195.8 / 339.5; prefill 2,392 / 2,590 / 2,579 at
+5.7K / 18K / 73K; arena 3.49 GiB, KV pool 5.21 GiB). The two uncapped span-4 reruns did not hang
+either (`p3s4piece` 2,043 / 2,579 / 2,535, `p3s4-b` 2,393 / 2,579 / 2,605), so the hang stands at
+once in three uncapped step-pass runs and its cause is still open. Every other number in this section is from an uncapped build
+(`bf8ff141` the first table and the profile, `bbd84d42` the second), and so are the two span-4
+reruns of `~/hy4/cola/span4.sh` (`p3s4piece` with `prefill-span-pass: piece`, `p3s4-b` with the
+step pass, both `bbd84d42`): they say whether the uncapped step pass is what hangs.
+
+Cost in memory at 196K and 8 sequences, a card: the activation arena goes from 1.29 GiB to
+2.20 GiB at span 2 and 4.02 GiB at span 4, out of the KV pool (7.51 GiB, 6.57 GiB and 4.68 GiB:
+2.7, 2.4 and 1.7 sessions of 196K); the experts' share stays 16.73 GiB.
+
+KL against FP32 (`perf-kl-22.yaml` with the span keys, 210 W, 10,851 positions, compared with the
+served build's rows): without a span every position is equal. Span 2: mean 0.18608 -> 0.18435,
+|dKL| p50 4.2e-5, p99 1.51, 471 top-1 changes; without `prefill-span-first` 0.18878, p99 0.84, 298
+changes; span 4: 0.17997, p99 1.51, 480 changes. All inside the envelope (mean 0.165-0.195, p50
+<= 8e-3, p99 <= 2.4, <= 850 changes); only the one document longer than 2048 tokens changes (8,447 tokens; the other
+three, 283 to 1,799 tokens, are one step with or without the span and stay bit for bit). The
+plane a step tall gives the windowed plane's rows bit for bit.
+
+## Concurrent and chained hy4k launches (2026-11-22/23)
+
+Until this round `kernels/hy4k/exports.cpp` declared neither `rad_kernel_concurrent` nor
+`rad_kernel_chain`, so every hy4k launch (about 400 of the ~1750 a decode step) was ordered on both
+sides, and the chained libr4d launch behind it kept its barrier bit too. Both are now exported, as the
+Inkling 2 plugin does (`radiance-inkling2-plugin`, `docs/DESIGN.md` rounds 4 and 7).
+
+- **Concurrent** (`rad_kernel_concurrent` = 1 for every card row). Each card row reads and writes only
+  its operands and the engine's scratch; the indexer tail, the Engram history and the DFly2 ring are
+  INOUT operands. In a recorded pass the engine then orders a hy4k launch by the byte ranges it
+  touches (`core/runtime/ctx.cpp`, `haz_mark`). A row's own launches stay in order (`hc_pre`'s two
+  passes, form 2g and its merge, the n-gram ids and state). `HY4K_CONCURRENT=0` withdraws it.
+- **Chained** (`rad_kernel_chain` = 2). Every hy4k kernel is a template whose first parameter is a chain
+  tag (`r4dchain` or `Unchained`, `dev_common.h`), and launchers pick the form from the `chain`
+  parameter the engine sets where chaining is on (`HY4_CHAINED`, `HY4_CHAINED_T`). The chained
+  form's prologue waits on the queue's completion counter, then acquires at agent scope and runs
+  `s_dcache_inv`, which is why the rows answer 2. Its epilogue adds one per block. This is
+  libr4d's `r4d_chain.h`, with two changes:
+  - **The body runs as a lambda** between `chain_wait` and `chain_done`. Its `return`s leave the lambda,
+    so every lane of the wave reaches the epilogue together. The plain form is the same code with
+    empty brackets. Its ISA differs from the earlier build only in register allocation and in the
+    order of commutative operands; the order of the sums is unchanged.
+  - **The epilogue counts waves, not a block barrier.** hy4k bodies return early per wave
+    (`mla_attn2_k`'s `if (wave) return;`) and per thread (`attn_sink_k`). With libr4d's
+    barrier-then-add, a wave that left early would meet the final barrier while another wave waits
+    at one of the body's barriers. The hardware releases both, and the block's add could land before
+    its last write. Instead, each wave releases its own writes at agent scope and adds one to a
+    counter in LDS. The wave that brings the counter to the block's wave count adds the block's one
+    to the queue counter. `chain_wait` zeroes the LDS counter behind its barrier, while every wave
+    is still in.
+  - **The wave count is counted, not read.** `gridDim`/`blockDim` are hidden kernel arguments: reading
+    them took `idx_score_k`'s chained form to 800 bytes of arguments, over the backend's 768. The
+    dispatch packet is not usable either. With chained launches the packet processor runs far ahead
+    of the kernels and the host reuses a packet's ring slot once it is read, so a block that starts
+    or ends late reads another launch's packet. A first build read the sizes there; it is not the
+    one measured below. `chain_wait` has every wave add one to an LDS counter between two
+    barriers. `tools/kernarg.sh`: largest segment 736 bytes, no scratch, no kernel at 256 VGPRs.
+  - `HY4K_CHAIN=0` withdraws the export, so hy4k launches keep their barrier bit.
+    `tests/test_dev.py --chain` runs every card call with `chain = 1`. HIP writes no record, so the
+    chained forms neither wait nor count, and the run checks that they compute what the plain forms do.
+- **Chained only for small launches.** A launch chains when the engine sets `chain = 1` and its
+  first operand has at most `HY4K_CHAIN_ROWS` rows (default 64: decode, and a DFly2 verify of up to
+  8 sequences of 6 rows). It reads the rows from the tensor, not from the `M` parameter, which the
+  engine resolves to the band's bound (2048 in a decode pass too). A larger launch takes the plain
+  form, and the engine orders it with the barrier bit as before. Chaining every launch measured
+  decode +3-7 % but prefill -7 to -9 % at 5.7K, and the first 18K prompt ran at a third of the
+  rate in some runs (742-1493 tok/s against 2,700).
+
+**Measured (2026-11-23, 2x R9700 at 330 W, NVMe composite <= 50 °C before each run; the GPTQ
+container, tp 2, 196K, 8 sequences; queue `~/hy4/cola/s22/q5.sh` on the test machine, results in
+`~/hy4/cola/resultados/s22/`).** base is this tree before the round (hy4k `f8ea8e9f`); conc adds the
+concurrent export; chain is conc plus chained forms at <= 64 rows (`HY4_MLA_PROJ=old`, so the
+projection is the one base serves). Decode is `bench_throughput` (raw prompt, 256 tokens); chat is
+one client on code / tool-call / Spanish prompts (two each, tok/s including the time to the first
+token); 18K decode is one client after an ~18K prompt. Each row is two runs, except conc (one).
+
+| | decode 1 / 4 / 8 | prefill 5.7K / 18K | chat code / tools / Spanish | 18K decode |
+|---|---|---|---|---|
+| base | 57.5-57.6 / 195.5-196.8 / 339.4-340.0 | 3,000-3,012 / 2,715-2,726 | 49.3 / 45.7 / 52.1 | 43.4-44.5 |
+| conc | 58.4 / 199.4 / 345.9 | 3,052 / 2,787 | — / 46.2 / 52.9 | 43.6-44.8 |
+| chain | 61.3 / 202.5-207.2 / 352.7-353.8 | 3,004-3,009 / 2,701-2,728 | 52.0 / 48.1 / 55.0 | 45.3-46.8 |
+| base, DFly2 | 109.7-111.1 / 364.7-366.7 / 454.1-458.0 | 2,953-3,013 / 2,698-2,744 | 76.8 / 81.7 / 52.2 | 82-95 |
+| conc, DFly2 | 112.3 / 365.6 / 457.2 | 2,960 / 2,692 | 77.5 / 82.6 / 52.8 | 86-91 |
+| chain, DFly2 | 114.5-114.7 / 381.7-382.5 / 461.5-462.9 | 2,962-2,971 / 2,700-2,708 | 79.0 / 83.8 / 54.2 | 84-90 |
+| chain, DFly2, `RADIANCE_AQL_CHAIN_FENCE=1` | 113.2 / 377.3 / 456.2 | 2,942 / 2,641 | 78.2 / 83.1 / 53.5 | — |
+
+(The one conc run had one slow request in the code pair, 27.4 tok/s, left out of the table.)
+
+So without speculation chaining gives +6.5 % at one client, +4 % at four and eight, and +5 % on chat.
+With DFly2 it gives +3.5 %, +4.5 % and +1 %. Prefill is unchanged. The concurrent export alone is
+within 1-2 %.
+
+**The fence.** In this session DFly2 at 8 clients did not lose without the fence, on base or on the
+new build: base 442.7-458.0 without it against 456.3-458.0 with it; chain 461.5-462.9 against 456.2.
+The drafter's counters over the bench were 4277 accepted of 6412 drafted with and without the
+fence in every correct build. So the earlier diagnosis stands: equal acceptance, no stale data.
+The 8-client loss of 2.2.0's first runs (415-422) did not reproduce today, so the fence is no
+longer needed for DFly2 with this build. Serve without it, and keep `run-hy4.sh`'s pass-through
+for comparisons.
+
+**Checks.** KL against FP32 (`perf-kl-22.yaml`, 210 W): conc and chain are bit-identical to
+`final-22` at all 10,851 positions, scored in 2048-row prefill chunks and in 32-row steps (the
+32-row steps run the chained forms). `tests/test_dev.py` passes 213 of 213 on gfx1201 and gfx1150,
+plain and `--chain`. The greedy texts of the short and the long prompt are the same bytes in every
+build, with and without DFly2.
+
+Batch invariance (`no-prefix-cache: true`, two prompts sent together, three repeats, 210 W): the
+base build itself gives 2 or 3 different pairs of texts over three repeats, with and without DFly2.
+The libr4d trunk picks GEMM forms by the step's rows, and the two requests do not always land in
+the same steps. The chain build's pairs are among the ones base produces, and each prompt sent
+alone gives the same text in both builds. A repeated pair is not a test this deployment can pass;
+the comparison against base is.
+
+**A bug that a single-prompt KL does not see.** The first chained build read the block's size from
+the dispatch packet. With 4 and 8 clients the drafter's counters changed (4141/5836 against
+4277/6412), and prefill fell to 1,171 / 871 tok/s. Yet the KL and the greedy hashes were bit-identical,
+because both run one sequence. Counting the waves in LDS fixed both. A chained form has to be
+checked with several clients as well.
+
+## The wide mla_project (2026-11-23)
+
+`hy4_mla_project` (the absorbed MLA's per-head projections in prefill) now runs `mla_proj2_k` in
+`kernels/hy4k/dev_attn.hip`. It follows the Direct-B style of gostar's radiance PR #586
+(`libr4d/r4d_moe_nvfp4.hip`): every wave reads its B fragments straight from global memory with
+16-byte loads, with no LDS stage.
+
+- **The absorb B is read with `global_load_tr_b128`**, not with eight 2-byte loads a lane. The absorb
+  B is the weight's key block read across rows (`B[n][k] = W[head*2d + k][n]`). In each group of eight
+  lanes, lane i names row `k = 4*(lane>>4) + (i&3) + 8*(i>>2)` at the group's eight-column base, and
+  lane j receives column base + j of those eight rows. That is exactly the fragment `mla_proj_k`
+  built, so the weight needs no transposed copy. A pre-transposed key block would have cost about
+  230 MB a card of expert residency. The expand B was already K-contiguous.
+- **Tiles and prefetch.** A block is WR x WC waves (default 4 x 4: 128 rows by 128 columns of one
+  head). A wave owns 32 x 32 with four accumulators, so each A fragment serves two B fragments and
+  each B fragment two A fragments. The next K step's fragments load before this step's WMMAs; a
+  load past K reads the last step again, so every load has a valid address and no branch.
+- **Head-major grid.** The grid is (heads, column tiles, row tiles). `mla_proj_k`'s (row tiles,
+  column tiles, heads) kept the blocks in flight on one head's rows. That order is what made 4096
+  rows cost 4-6 times 2048 rows, in either kernel.
+- **The same bits.** Every WMMA gets the fragments `mla_proj_k` gave it for the same (row, column, K
+  step), and K is walked in the same order from a zero accumulator. `tests/bench_proj.py` checks
+  every block shape against `mla_proj_k` byte for byte (gfx1201 and gfx1150). The KL against FP32 is
+  `final-22` at all 10,851 positions, in 2048-row chunks and in 32-row steps. `HY4_MLA_PROJ=old`
+  serves `mla_proj_k` again, and `proj_form`, `proj_wr`, `proj_wc` and `proj_hm` are the test
+  parameters.
+
+The kernel alone (`tests/bench_proj.py`, R9700 at 330 W, ms; 32 heads a rank as in the window
+layers, 16 as in the sparse ones):
+
+| | absorb 2048 | absorb 4096 | expand 2048 | expand 4096 |
+|---|---|---|---|---|
+| `mla_proj_k`, 32 heads | 2.13 | 12.47 | 2.25 | 7.40 |
+| wide, 4 x 4, head-major, 32 heads | 0.41 | 0.80 | 1.55 | 2.80 |
+| `mla_proj_k`, 16 heads | 0.60 | 2.13 | 0.86 | 3.77 |
+| wide, 4 x 4, head-major, 16 heads | 0.17 | 0.33 | 0.42 | 0.89 |
+
+The same tiles on the row-major grid gave 0.78 / 3.36 (absorb) and 1.58 / 3.31 (expand) at 32
+heads: the tiles halve the time, and the head-major order takes the superlinear part away.
+
+Full model (2026-11-23, 2x R9700 at 330 W, NVMe <= 50 °C, no spec, the concurrent and chained build of
+the section above; prefill p50 over three requests, two runs each; `HY4_MLA_PROJ=old` is the
+same build serving `mla_proj_k`):
+
+| | prefill 5.7K | 18K | 73K | decode 1 / 4 / 8 |
+|---|---|---|---|---|
+| `mla_proj_k` | 2,977-3,006 | 2,686-2,732 | 2,597-2,611 (one disturbed run: 1,646) | 61.4-61.7 / 206.8-207.7 / 352.4-353.8 |
+| wide | 3,234-3,342 | 2,983-3,012 | 2,792-2,833 | 61.4 / 207.4-207.9 / 354.4-355.3 |
+| wide, DFly2 | 3,261 | 3,009 | — | 114.5 / 382.6 / 461.0 |
+
+That is +9-11 % at 5.7K, +11 % at 18K and +7-9 % at 73K, with decode unchanged (decode keeps
+libr4d's `mla_project` up to 32 rows). The greedy texts are the same bytes, with and without
+DFly2.

@@ -1,5 +1,6 @@
-/* COPY of radiance 2.2.0's arch/common/rad_fp8.h with one change for hyv4flash: GateQuantFP8
- * accepts `rot` with clamp (search for «hyv4flash (vendor)»). It is included before the installed
+/* COPY of radiance 2.2.0's arch/common/rad_fp8.h with two changes for hyv4flash: GateQuantFP8
+ * accepts `rot` with clamp, and its clamped step issues at most 32768 rows a launch (search for
+ * «hyv4flash (vendor)»). It is included before the installed
  * header (hyv4flash's CMakeLists) and its guard keeps the original out. When moving to another
  * radiance version, redo it from the new one, or drop it if upstream already serves this case. */
 /* rad_fp8.h -- the pieces every block-scaled FP8 block is built from: a linear whose weight is E4M3
@@ -746,12 +747,20 @@ inline void GateQuantFP8::step(RadCtx* c, rad_buf gate_up, int64_t T, int64_t r0
         return;
     }
     if (clipped) {
-        RAD_ISSUE_N(c, op, rows, brow_slice(gate_up, r0, rows, 2 * n),
-                    brow_slice(a.x, r0, rows, n));
-        if (op_quant)
-            RAD_ISSUE_N(c, op_quant, rows, brow_slice(a.x, r0, rows, n),
-                        brow_slice(a.cq(), r0, rows, n),
-                        brow_slice(a.cs(), r0, rows, n / a.cg()));
+        /* hyv4flash (vendor): at most 32768 rows a launch. libr4d's swiglu_clamped refuses 65536
+         * rows or more (its grid's first dimension), and a routed pass a spanned step tall
+         * (--prefill-span-pass step) is 16 slots a token: 65536 rows at 4096 tokens. Both ops are
+         * per row, so the slices write the bytes one launch would; a pass of up to 2048 tokens is
+         * one launch, as upstream issues it (and no rows issue nothing, where upstream issues). */
+        const int64_t kClipRows = 32768;
+        for (int64_t o = 0; o < rows; o += kClipRows) {
+            const int64_t nr = rows - o < kClipRows ? rows - o : kClipRows, q0 = r0 + o;
+            RAD_ISSUE_N(c, op, nr, brow_slice(gate_up, q0, nr, 2 * n), brow_slice(a.x, q0, nr, n));
+            if (op_quant)
+                RAD_ISSUE_N(c, op_quant, nr, brow_slice(a.x, q0, nr, n),
+                            brow_slice(a.cq(), q0, nr, n),
+                            brow_slice(a.cs(), q0, nr, n / a.cg()));
+        }
         return;
     }
     if (bf16 || op_q) {

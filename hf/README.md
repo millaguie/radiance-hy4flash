@@ -57,10 +57,26 @@ and pinned host memory, and the Engram tables are read from an NVMe drive.
 
 | | decode, 1 client | 4 clients | 8 clients | prefill, 5.7K tokens | 18K tokens |
 |---|---|---|---|---|---|
-| no speculation | 57.7 tok/s | 196.2 | 360.6 | 3,036 tok/s | 2,706 |
-| DFly2, adaptive window, `RADIANCE_AQL_CHAIN_FENCE=1` | 109.8 tok/s | 341.3 | 425 (425 to 603 across runs) | 2,976 tok/s | — |
+| no speculation | 61.4 tok/s | 207.6 | 355 | 3,290 tok/s | 3,000 |
 
-The decode figures at 4 and 8 clients are the sum over the clients.
+The decode figures at 4 and 8 clients are the sum over the clients. Without speculation the bench
+prompt does not matter for decode speed.
+
+**The DFly2 numbers of the first release were inflated.** The bench sends a raw completion prompt,
+and the model loops on it (only 29.5 % of the word 6-grams of the output are distinct). A drafter
+predicts a loop very well, so the bench gave 109.8 tok/s at one client. With chat prompts the gain
+depends on the text. One client, time to the first token included, tok/s:
+
+| chat prompt | no speculation | DFly2 | drafted tokens accepted |
+|---|---|---|---|
+| code | 52.0 | 79.0 | 66 % |
+| tool calls | 48.1 | 83.8 | 97 % |
+| Spanish prose | 55.0 | 54.2 | 31 % |
+| six chats at once (sum) | 128 | 109 | 51 % |
+
+DFly2 pays off for code and tool calls at one or two clients. For prose, and for several clients
+at once, serve without it (`num-speculative-tokens: 0`). The six-chat row was measured on the
+previous kernels; the other rows on the current ones.
 
 Quality:
 
@@ -74,7 +90,7 @@ For comparison, on the same machine:
 | | prefill | decode, 1 client | 4 clients | 8 clients | BFCL v4 `non_live` |
 |---|---|---|---|---|---|
 | llama.cpp (PR #32517), AngelSlim Q4_K_M GGUF, tuned | 360 tok/s | 13.75 tok/s | — | — | — |
-| this container, DFly2 | 2,976 tok/s | 109.8 tok/s | 341.3 | 425 | 79.56 % |
+| this container, no speculation | 3,290 tok/s | 61.4 tok/s | 207.6 | 355 | 79.56 % (with DFly2) |
 | Qwen3.8-Flash-Next on radiance (all weights in VRAM) | ~6,400 tok/s | 201 tok/s | 581 | 972 | 84.17 % |
 
 ## How to run it
@@ -100,7 +116,6 @@ docker run -d --name hy4-flash --network host --init --ulimit memlock=-1 \
     --device /dev/kfd --device /dev/dri --security-opt seccomp=unconfined \
     --group-add "$(getent group render | cut -d: -f3)" \
     --group-add "$(getent group video | cut -d: -f3)" \
-    -e RADIANCE_AQL_CHAIN_FENCE=1 \
     -v ~/hy4:/hy4 -v ~/models/rad:/models:ro \
     stilldeadcode/radiance:2.2.0 --config /hy4/example-tp2-dfly2.yaml
 ```

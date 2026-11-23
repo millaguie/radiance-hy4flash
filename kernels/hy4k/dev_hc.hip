@@ -13,10 +13,12 @@ namespace {
 constexpr int kThreads = 256;
 
 /* One block per row. The row of streams (hc·n ≤ 16384 values) is read once into LDS as f32. */
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void hc_pre_k(const void* h, int hdt, long hp, long hs, const float* fn,
                                                    long fp, const float* base, long bs, const float* scale, long ss,
                                                    void* x, int xdt, long xp, long xs, float* post, long pp, long ps,
                                                    int n, int hc, int head, float eps, float heps, float mag) {
+    HY4_CHAIN_BODY {
     /* The row goes to LDS if it fits (up to 14336 values); else it is read from memory each time. */
     extern __shared__ float flat[];
     __shared__ float red[kThreads / 32];
@@ -40,7 +42,7 @@ __global__ __launch_bounds__(kThreads) void hc_pre_k(const void* h, int hdt, lon
         d = block_sum<kThreads>(d, red);
         if (threadIdx.x == 0) coef[j] = d * inv;
     }
-    __syncthreads();
+    lds_barrier();
     if (threadIdx.x < hc) {
         const int j = threadIdx.x;
         const float s0 = scale[0];
@@ -48,13 +50,14 @@ __global__ __launch_bounds__(kThreads) void hc_pre_k(const void* h, int hdt, lon
         if (!head)
             post[r * pp + (long)j * ps] = mag * dsigmoid(coef[hc + j] * scale[ss] + base[(long)(hc + j) * bs]) + heps;
     }
-    __syncthreads();
+    lds_barrier();
     for (int i = threadIdx.x; i < n; i += kThreads) {
         float v = 0;
         for (int j = 0; j < hc; ++j) v += pre[j] * HV(j * n + i);
         dst(x, xdt, r * xp + (long)i * xs, v);
     }
 #undef HV
+    } HY4_CHAIN_END
 }
 
 /* The same row in one pass: each thread accumulates the norm and the MIX dot products from one read
@@ -64,11 +67,12 @@ __global__ __launch_bounds__(kThreads) void hc_pre_k(const void* h, int hdt, lon
  * hc_pre_k, so the output is bit-identical: 512 threads was 3% faster but moved the model's KL
  * against FP32 from 0.177 to 0.188, a reordering this model amplifies through its layers. */
 constexpr int kThreads1 = 256;
-template <int MIX>
+template <class Ch, int MIX>
 __global__ __launch_bounds__(kThreads1) void hc_pre1_k(const void* h, int hdt, long hp, long hs, const float* fn,
                                                      long fp, const float* base, long bs, const float* scale, long ss,
                                                      void* x, int xdt, long xp, long xs, float* post, long pp, long ps,
                                                      int n, int hc, int head, float eps, float heps, float mag) {
+    HY4_CHAIN_BODY {
     extern __shared__ float flat[];
     __shared__ float red[kThreads1 / 32][MIX + 1];
     __shared__ float tot[MIX + 1];
@@ -93,25 +97,26 @@ __global__ __launch_bounds__(kThreads1) void hc_pre1_k(const void* h, int hdt, l
     if (lane == 0)
 #pragma unroll
         for (int j = 0; j <= MIX; ++j) red[wave][j] = acc[j];
-    __syncthreads();
+    lds_barrier();
     if (t <= MIX) {
         float v = 0.0f;
         for (int w = 0; w < kThreads1 / 32; ++w) v += red[w][t];
         tot[t] = v;
     }
-    __syncthreads();
+    lds_barrier();
     const float inv = 1.0f / sqrtf(tot[MIX] / (float)W + eps);
     if (t < hc) {
         pre[t] = dsigmoid(tot[t] * inv * scale[0] + base[(long)t * bs]) + heps;
         if (!head)
             post[r * pp + (long)t * ps] = mag * dsigmoid(tot[hc + t] * inv * scale[ss] + base[(long)(hc + t) * bs]) + heps;
     }
-    __syncthreads();
+    lds_barrier();
     for (int i = t; i < n; i += kThreads1) {
         float v = 0;
         for (int j = 0; j < hc; ++j) v += pre[j] * (lds ? flat[j * n + i] : dld(h, hdt, r * hp + (long)(j * n + i) * hs));
         dst(x, xdt, r * xp + (long)i * xs, v);
     }
+    } HY4_CHAIN_END
 }
 
 /* hc_pre1_k split over the card, for the few rows of a decode step (1-8 rows were 1-8 blocks on a
@@ -161,9 +166,10 @@ __device__ inline void hc_chains(const void* h, const long (&ro)[R], long hs, co
 
 /* grid (8·(MIX + 1), ceil(rows / R)), one wave a block: block b is virtual wave b % 8 of sum b / 8
  * (sum MIX is the norm) for rows [R·y, R·y + R). The R rows share the fn loads. part[row][j][w]. */
-template <int MIX, int R, int DT>
+template <class Ch, int MIX, int R, int DT>
 __global__ __launch_bounds__(32) void hc_pre_part_k(const void* h, long hp, long hs, const float* fn, long fp,
                                                    float* part, int rows, int W) {
+    HY4_CHAIN_BODY {
     constexpr int U = R == 1 ? 16 : R == 2 ? 8 : 4;   // read-ahead, ~40 VGPRs at every R
     const int w = blockIdx.x % kVWaves, j = blockIdx.x / kVWaves, lane = threadIdx.x;
     const int t = w * 32 + lane;                       // hc_pre1_k's thread
@@ -184,16 +190,18 @@ __global__ __launch_bounds__(32) void hc_pre_part_k(const void* h, long hp, long
 #pragma unroll
         for (int q = 0; q < R; ++q)
             if (r0 + q < rows) part[((long)(r0 + q) * (MIX + 1) + j) * kVWaves + w] = acc[q];
+    } HY4_CHAIN_END
 }
 
 /* grid (ceil(n / 256), rows): each block closes the row's sums (the same few adds in every block of
  * the row) and writes 256 columns of x; block 0 writes post. */
-template <int MIX>
+template <class Ch, int MIX>
 __global__ __launch_bounds__(kThreads1) void hc_pre_fin_k(const void* h, int hdt, long hp, long hs, const float* part,
                                                         const float* base, long bs, const float* scale, long ss,
                                                         void* x, int xdt, long xp, long xs, float* post, long pp,
                                                         long ps, int n, int hc, int head, float eps, float heps,
                                                         float mag) {
+    HY4_CHAIN_BODY {
     __shared__ float tot[MIX + 1];
     __shared__ float pre[16];
     const long r = blockIdx.y;
@@ -204,40 +212,46 @@ __global__ __launch_bounds__(kThreads1) void hc_pre_fin_k(const void* h, int hdt
         for (int w = 0; w < kVWaves; ++w) v += p[w];
         tot[t] = v;
     }
-    __syncthreads();
+    lds_barrier();
     const float inv = 1.0f / sqrtf(tot[MIX] / (float)W + eps);
     if (t < hc) {
         pre[t] = dsigmoid(tot[t] * inv * scale[0] + base[(long)t * bs]) + heps;
         if (!head && blockIdx.x == 0)
             post[r * pp + (long)t * ps] = mag * dsigmoid(tot[hc + t] * inv * scale[ss] + base[(long)(hc + t) * bs]) + heps;
     }
-    __syncthreads();
+    lds_barrier();
     const int i = blockIdx.x * kThreads1 + t;
     if (i < n) {
         float v = 0;
         for (int j = 0; j < hc; ++j) v += pre[j] * dld(h, hdt, r * hp + (long)(j * n + i) * hs);
         dst(x, xdt, r * xp + (long)i * xs, v);
     }
+    } HY4_CHAIN_END
 }
 
-template <int MIX, int R>
+template <class Ch, int MIX, int R>
 void (*part_kernel(int dt))(const void*, long, long, const float*, long, float*, int, int) {
-    return dt == 1 ? hc_pre_part_k<MIX, R, 1> : dt == 2 ? hc_pre_part_k<MIX, R, 2> : hc_pre_part_k<MIX, R, 0>;
+    return dt == 1 ? hc_pre_part_k<Ch, MIX, R, 1> : dt == 2 ? hc_pre_part_k<Ch, MIX, R, 2> : hc_pre_part_k<Ch, MIX, R, 0>;
 }
 
+template <class Ch>
 __global__ void hc_post_k(void* h, int hdt, long hp, long hs, const void* y, int ydt, long yp, long ys,
                           const float* post, long pp, long ps, int n, int hc) {
+    HY4_CHAIN_BODY {
     const long r = blockIdx.y;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= hc * n) return;
     const int j = i / n, c = i - j * n;
     const long o = r * hp + (long)i * hs;
     dst(h, hdt, o, post[r * pp + (long)j * ps] * dld(y, ydt, r * yp + (long)c * ys) + dld(h, hdt, o));
+    } HY4_CHAIN_END
 }
 
+template <class Ch>
 __global__ void mla_kv_k(const void* kvx, int xdt, long xp, long xs, const void* kr, int rdt, long rp, long rs,
                          void* k, int kdt, long kp, long ks, void* v, int vdt, long vp, long vs, int H, int nope,
                          int rope, int vd) {
+    HY4_CHAIN_BODY {
     const long r = blockIdx.y;
     const int per = nope + vd, kw = rope + nope;
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -251,6 +265,7 @@ __global__ void mla_kv_k(const void* kvx, int xdt, long xp, long xs, const void*
         const int hh = i / vd, c = i - hh * vd;
         dst(v, vdt, r * vp + (long)i * vs, dld(kvx, xdt, r * xp + ((long)hh * per + nope + c) * xs));
     }
+    } HY4_CHAIN_END
 }
 
 }  // namespace
@@ -318,13 +333,18 @@ int hy4_dev_hc_pre(const RadArgs* a, RadStream s) {
         const int64_t rq = pi(a, "hc_r", rows <= 8 ? 1 : 4);
         const int R = rq == 4 ? 4 : rq == 2 ? 2 : 1;
         float* part = (float*)a->scratch;
-        auto pk = mix == 8 ? (R == 1 ? part_kernel<8, 1>(dcode(h)) : R == 2 ? part_kernel<8, 2>(dcode(h)) : part_kernel<8, 4>(dcode(h)))
-                           : (R == 1 ? part_kernel<4, 1>(dcode(h)) : R == 2 ? part_kernel<4, 2>(dcode(h)) : part_kernel<4, 4>(dcode(h)));
+        auto pick = [&](auto ch) {
+            using Ch = decltype(ch);
+            const int dt = dcode(h);
+            return mix == 8 ? (R == 1 ? part_kernel<Ch, 8, 1>(dt) : R == 2 ? part_kernel<Ch, 8, 2>(dt) : part_kernel<Ch, 8, 4>(dt))
+                            : (R == 1 ? part_kernel<Ch, 4, 1>(dt) : R == 2 ? part_kernel<Ch, 4, 2>(dt) : part_kernel<Ch, 4, 4>(dt));
+        };
+        auto pk = chain_param(a) ? pick(r4dchain{}) : pick(Unchained{});
         int rc = emit(s, pk, dim3((unsigned)(kVWaves * (mix + 1)), (unsigned)((rows + R - 1) / R)), dim3(32), 0u, h.data,
                       h.stride[0], h.stride[h.rank - 1], (const float*)fn.data, fn.stride[0], part, (int)rows,
                       (int)width);
         if (rc != RAD_OK) return rc;
-        return emit(s, mix == 8 ? hc_pre_fin_k<8> : hc_pre_fin_k<4>,
+        return emit(s, mix == 8 ? HY4_CHAINED_T(a, hc_pre_fin_k, 8) : HY4_CHAINED_T(a, hc_pre_fin_k, 4),
                     dim3((unsigned)((n + kThreads1 - 1) / kThreads1), (unsigned)rows), dim3(kThreads1), 0u, h.data,
                     dcode(h), h.stride[0], h.stride[h.rank - 1], (const float*)part, (const float*)base.data,
                     base.stride[0], (const float*)scale.data, scale.stride[0], x.data, dcode(x), x.stride[0],
@@ -332,13 +352,13 @@ int hy4_dev_hc_pre(const RadArgs* a, RadStream s) {
                     head ? 0 : post->stride[1], (int)n, (int)hc, (int)head, eps, heps, mag);
     }
     if (mix == 8 || mix == 4)
-        return emit(s, mix == 8 ? hc_pre1_k<8> : hc_pre1_k<4>, dim3((unsigned)rows), dim3(kThreads1), lds, h.data,
+        return emit(s, mix == 8 ? HY4_CHAINED_T(a, hc_pre1_k, 8) : HY4_CHAINED_T(a, hc_pre1_k, 4), dim3((unsigned)rows), dim3(kThreads1), lds, h.data,
                      dcode(h), h.stride[0], h.stride[h.rank - 1], (const float*)fn.data, fn.stride[0],
                      (const float*)base.data, base.stride[0], (const float*)scale.data, scale.stride[0], x.data,
                      dcode(x), x.stride[0], x.stride[1], head ? nullptr : (float*)post->data,
                      head ? 0 : post->stride[0], head ? 0 : post->stride[1], (int)n, (int)hc, (int)head, eps, heps,
                      mag);
-    return emit(s, hc_pre_k, dim3((unsigned)rows), dim3(kThreads), lds, h.data,
+    return emit(s, HY4_CHAINED(a, hc_pre_k), dim3((unsigned)rows), dim3(kThreads), lds, h.data,
                  dcode(h), h.stride[0], h.stride[h.rank - 1], (const float*)fn.data, fn.stride[0],
                  (const float*)base.data, base.stride[0], (const float*)scale.data, scale.stride[0], x.data, dcode(x),
                  x.stride[0], x.stride[1], head ? nullptr : (float*)post->data, head ? 0 : post->stride[0],
@@ -355,7 +375,7 @@ int hy4_dev_hc_post(const RadArgs* a, RadStream s) {
         post.shape[0] != rows || post.dtype != RAD_F32)
         return RAD_E_SHAPE;
     const unsigned bx = (unsigned)((hc * n + 255) / 256);
-    return emit(s, hc_post_k, dim3(bx, (unsigned)rows), dim3(256), 0u, h.data, dcode(h), h.stride[0],
+    return emit(s, HY4_CHAINED(a, hc_post_k), dim3(bx, (unsigned)rows), dim3(256), 0u, h.data, dcode(h), h.stride[0],
                  h.stride[h.rank - 1], y.data, dcode(y), y.stride[0], y.stride[1], (const float*)post.data,
                  post.stride[0], post.stride[1], (int)n, (int)hc);
 }
@@ -371,7 +391,7 @@ int hy4_dev_mla_kv(const RadArgs* a, RadStream s) {
     const int64_t rows = kvx.shape[0];
     if (rows < 1 || kr.shape[0] != rows || k.shape[0] != rows || v.shape[0] != rows) return RAD_E_SHAPE;
     const int64_t w = std::max(H * (rope + nope), H * vd);
-    return emit(s, mla_kv_k, dim3((unsigned)((w + 255) / 256), (unsigned)rows), dim3(256), 0u, kvx.data,
+    return emit(s, HY4_CHAINED(a, mla_kv_k), dim3((unsigned)((w + 255) / 256), (unsigned)rows), dim3(256), 0u, kvx.data,
                  dcode(kvx), kvx.stride[0], kvx.stride[kvx.rank - 1], kr.data, dcode(kr), kr.stride[0],
                  kr.stride[1], k.data, dcode(k), k.stride[0], k.stride[k.rank - 1], v.data, dcode(v), v.stride[0],
                  v.stride[v.rank - 1], (int)H, (int)nope, (int)rope, (int)vd);

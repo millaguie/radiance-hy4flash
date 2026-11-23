@@ -34,11 +34,13 @@ __device__ inline long cuc_of(const void* cu, int cit, long cs, const void* crd,
     return acc;
 }
 
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void vit_compact_k(const void* pix, int pdt, long pp, long ps, const void* crd,
                                                         int rit, long r0, long r1, const void* cu, int cit, long cs,
                                                         int S, void* pc, int cdt, long cp, long css, void* crdc, int qit,
                                                         long q0, long q1, void* cuc, int uit, long us, int dim,
                                                         int merge, long Pc) {
+    HY4_CHAIN_BODY {
     const long p = blockIdx.x;
     if (p == 0 && threadIdx.x == 0) {
         long acc = 0;
@@ -67,6 +69,7 @@ __global__ __launch_bounds__(kThreads) void vit_compact_k(const void* pix, int p
         dsti(crdc, qit, dest * q0 + 2 * q1, h);
         dsti(crdc, qit, dest * q0 + 3 * q1, w - merge);
     }
+    } HY4_CHAIN_END
 }
 
 __device__ inline void src_taps(long dst_i, long extent, int side, long* i0, long* i1, float* l) {
@@ -80,9 +83,11 @@ __device__ inline void src_taps(long dst_i, long extent, int side, long* i0, lon
     *l = s - (float)a0;
 }
 
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void vit_pos_k(void* x, int xdt, long xp, long xs, const void* tab, int tdt,
                                                     long tp, long ts, const void* crd, int rit, long q0, long q1, int n,
                                                     int side) {
+    HY4_CHAIN_BODY {
     const long p = blockIdx.x;
     const long r = dldi(crd, rit, p * q0), c = dldi(crd, rit, p * q0 + q1);
     const long h = dldi(crd, rit, p * q0 + 2 * q1), w = dldi(crd, rit, p * q0 + 3 * q1);
@@ -103,12 +108,15 @@ __global__ __launch_bounds__(kThreads) void vit_pos_k(void* x, int xdt, long xp,
         const long o = p * xp + (long)i * xs;
         dst(x, xdt, o, dld(x, xdt, o) + v);
     }
+    } HY4_CHAIN_END
 }
 
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void vit_nl_k(const void* y, int ydt, long yp, long ys, const void* nl, int ndt,
                                                    long ns, const void* crd, int rit, long r0, long r1, const void* cu,
                                                    int cit, long cs, const void* cuc, int uit, long us, int S, void* out,
                                                    int odt, long op, long os, int n, int merge, long Rc) {
+    HY4_CHAIN_BODY {
     const long r = blockIdx.x, mm = (long)merge * merge, p = r * mm;
     const int s = segment_of(cu, cit, cs, S, p);
     const long f = dldi(crd, rit, p * r1), c = dldi(crd, rit, r0 + p * r1);
@@ -128,6 +136,7 @@ __global__ __launch_bounds__(kThreads) void vit_nl_k(const void* y, int ydt, lon
     }
     for (int i = threadIdx.x; i < n; i += kThreads)
         dst(out, odt, r * op + (long)i * os, k < 0 ? dld(nl, ndt, (long)i * ns) : dld(y, ydt, k * yp + (long)i * ys));
+    } HY4_CHAIN_END
 }
 
 /* The frequency ladder, computed on the host as the oracle does (pow in float) and passed by
@@ -140,9 +149,11 @@ struct FreqLadder {
 // The backend's room is 768 bytes, and it also counts HIP's ~256 bytes of hidden arguments.
 static_assert(sizeof(FreqLadder) + 128 + 256 <= 768, "rope_k arguments exceed the backend's room");
 
+template <class Ch>
 __global__ __launch_bounds__(kThreads) void rope_k(void* x, int xdt, long xp, const void* pos, int pit, long p0, long p1,
                                                  int multi, int hd, int half, float div, int im, int s1, int s2,
                                                  FreqLadder e) {
+    HY4_CHAIN_BODY {
     const long m = blockIdx.x;
     const int h = blockIdx.y;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
@@ -155,6 +166,7 @@ __global__ __launch_bounds__(kThreads) void rope_k(void* x, int xdt, long xp, co
         dst(x, xdt, b, x0 * c - x1 * sn);
         dst(x, xdt, b + 1, x1 * c + x0 * sn);
     }
+    } HY4_CHAIN_END
 }
 
 }  // namespace
@@ -172,7 +184,7 @@ int hy4_dev_vit_compact(const RadArgs* a, RadStream st) {
     if (!is_rank(cuc, 1) || !is_int(cuc) || cuc.shape[0] != S + 1 || !is_rank(pc, 2, dim) || !is_float(pc) ||
         !is_rank(crdc, 2, 4) || !is_int(crdc) || crdc.shape[0] != pc.shape[0] || pc.shape[0] < 1)
         return RAD_E_SHAPE;
-    return emit(st, vit_compact_k, dim3((unsigned)P), dim3(kThreads), 0u, pix.data, dcode(pix), pix.stride[0],
+    return emit(st, HY4_CHAINED(a, vit_compact_k), dim3((unsigned)P), dim3(kThreads), 0u, pix.data, dcode(pix), pix.stride[0],
                  pix.stride[1], crd.data, icode(crd), crd.stride[0], crd.stride[1], cu.data, icode(cu), cu.stride[0],
                  (int)S, pc.data, dcode(pc), pc.stride[0], pc.stride[1], crdc.data, icode(crdc), crdc.stride[0],
                  crdc.stride[1], cuc.data, icode(cuc), cuc.stride[0], (int)dim, (int)merge, (long)pc.shape[0]);
@@ -185,7 +197,7 @@ int hy4_dev_vit_pos(const RadArgs* a, RadStream st) {
     if (!is_rank(x, 2, n) || !is_float(x) || !is_rank(tab, 2, n) || tab.shape[0] != side * side + 1 || !is_float(tab) ||
         !is_rank(crd, 2, 4) || !is_int(crd) || crd.shape[0] != x.shape[0] || x.shape[0] < 1)
         return RAD_E_SHAPE;
-    return emit(st, vit_pos_k, dim3((unsigned)x.shape[0]), dim3(kThreads), 0u, x.data, dcode(x), x.stride[0],
+    return emit(st, HY4_CHAINED(a, vit_pos_k), dim3((unsigned)x.shape[0]), dim3(kThreads), 0u, x.data, dcode(x), x.stride[0],
                  x.stride[1], tab.data, dcode(tab), tab.stride[0], tab.stride[1], crd.data, icode(crd), crd.stride[0],
                  crd.stride[1], (int)n, (int)side);
 }
@@ -203,7 +215,7 @@ int hy4_dev_vit_newline(const RadArgs* a, RadStream st) {
         !is_rank(cu, 1) || !is_int(cu) || cu.shape[0] < 2 || !is_rank(cuc, 1) || !is_int(cuc) ||
         cuc.shape[0] != cu.shape[0])
         return RAD_E_SHAPE;
-    return emit(st, vit_nl_k, dim3((unsigned)R), dim3(kThreads), 0u, y.data, dcode(y), y.stride[0], y.stride[1],
+    return emit(st, HY4_CHAINED(a, vit_nl_k), dim3((unsigned)R), dim3(kThreads), 0u, y.data, dcode(y), y.stride[0], y.stride[1],
                  nl.data, dcode(nl), nl.stride[0], crd.data, icode(crd), crd.stride[0], crd.stride[1], cu.data,
                  icode(cu), cu.stride[0], cuc.data, icode(cuc), cuc.stride[0], (int)(cu.shape[0] - 1), out.data,
                  dcode(out), out.stride[0], out.stride[1], (int)n, (int)merge, (long)y.shape[0]);
@@ -247,7 +259,7 @@ int hy4_dev_rope(const RadArgs* a, RadStream st) {
         e.inv[i] = 1.0f / std::pow((float)theta, (float)(2 * i) / (float)rot);
     }
     const unsigned threads = (unsigned)std::min<int64_t>(kThreads, (half + 31) / 32 * 32);
-    return emit(st, rope_k, dim3((unsigned)M, (unsigned)(nh + nkv)), dim3(threads), 0u, x.data, dcode(x), x.stride[0],
+    return emit(st, HY4_CHAINED(a, rope_k), dim3((unsigned)M, (unsigned)(nh + nkv)), dim3(threads), 0u, x.data, dcode(x), x.stride[0],
                  pos.data, icode(pos), pos.stride[0], multi ? pos.stride[1] : 0, (int)multi, (int)hd, (int)half,
                  (float)(esc != 0.0 ? esc : 1.0), (int)(im ? 1 : 0), (int)sec[1], (int)sec[2], e);
 }

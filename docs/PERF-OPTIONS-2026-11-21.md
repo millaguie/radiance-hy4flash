@@ -64,3 +64,74 @@ Rows 2, 3, 6 and 11 together remove about 540 launches; that is about +8-14% dec
 - **Missing:** `kv-cache-dtype: i8` deserves a number before rejecting it: VRAM freed here becomes
   expert residency (speed). The Engram row cache is fixed at 2^19 rows a table
   (`libavx/avx_ngram.cpp:286`, `RowCache::kRows`): no knob in 2.1.0; enlarging it is a libavx change.
+
+## Done on 2026-11-22: LDS-only barriers and grouped-head decode attention
+
+From `owndoc/knowledge/gpu-r9700-rdna4/optimizaciones.md` (its #4 and #1). Details in
+`docs/OPS-HY4.md` § Card rows.
+
+- **LDS-only barriers, on by default.** Every `__syncthreads()` in hy4k that only orders LDS traffic is
+  now libr4d's `lds_barrier()` (all of them but `ring_store_k`'s `__syncthreads_or`), which drops the
+  `global_inv` that gfx12 put on both sides of each barrier (6 for 12 barriers in `mla_attn3_k`, 9 for
+  18 in `engram_gate_k`, 3 for 6 in `idx_score_k`; none left). **Bit for bit**: the KL is final-22's at
+  all 10851 positions, scored in 32-row steps it equals the 2.2 plugins' 32-row run, and the greedy
+  texts are the 2.2 plugins' bytes with and without DFly2. **Speed: no measurable change** (form 3
+  stays at 3.30 ms on a 2048-row chunk; full model within the session's spread, table below).
+- **Form 2g of `hy4_mla_attn`, opt-in (`HY4_MLA_ATTN=g`).** Heads grouped by 16 on BF16 WMMA, the
+  history split in slices fixed by the head count (batch-invariant: a verify row gives the decode row's
+  bits, and the greedy texts are the same bytes with and without DFly2). The attention call is 1.5-3.9x
+  faster at decode geometry (sparse layer, 1 row 152 -> 42 µs, 8 rows 261 -> 84 µs; window layer
+  8 rows 151 -> 48 µs), and decode after an 18K prompt is +11% (1 client) to +14% (4 clients). It
+  stays opt-in because in the KL scored in 32-row steps (the only KL that reaches it) its p99 |dKL|
+  was 2.43-2.62 in three legal samples against the envelope's 2.4, where the per-head form's own
+  reorders gave 2.26-2.49 (`docs/OPS-HY4.md`). With DFly2 at 1 client and a short prompt it lost 8%
+  (108.8 -> 99.7 tok/s, three runs each, acceptance unchanged at 0.665 against 0.667) and 1-5% at 4
+  clients; not isolated. The suspect is the drafter's block-key attention, where a short history
+  leaves form 2g's fixed cost (16 slices and the merge launch) uncovered: a build with the block keys
+  back on the per-head form (`if (grouped) return form2g(true, ...)` off) was built but not measured.
+
+Speed on the test machine, one session (330 W, NVMe composite <= 60 °C before each run, ~/hy4/cola/opt/opt.sh
+and opt2.sh, results in ~/hy4/cola/resultados/opt/). base = the 2.2 plugins (home-22); lds = the new
+hy4k with form 2g off, i.e. the default of this build; 2g = the new hy4k with form 2g on (the build
+that was measured had it on by default, the same kernels as `HY4_MLA_ATTN=g` now). Decode 1/4/8 is
+`bench_throughput` (short prompt, 256 tokens); "18K decode" is `largo.py` (256 tokens after an ~18K
+prompt, two runs each); prefill is `prefill_fijo` p50.
+
+| | decode 1 | 4 | 8 | prefill 5.7K | 18K | 18K decode 1 client | 4 clients |
+|---|---|---|---|---|---|---|---|
+| base | 57.5 / 57.4 | 196.5 / 191.7 | 341.5 / 338.5 | 3,066 / 2,912 | 2,765 / 2,739 | 41.3-43.3 / 41.2-43.2 | 107.8-108.2 / 107.2-108.9 |
+| lds | 57.6 | 200.3 | 340.2 | 2,934 | 2,679 | 42.5-44.5 | 111.7-115.8 |
+| 2g | 58.0 / 57.9 | 197.7 / 197.2 | 364.6 / 365.0 | 3,017 / 2,988 | 2,743 / 2,697 | 45.9-48.8 / 45.8-48.7 | 122.4-124.6 / 119.6-124.7 |
+| base, DFly2 (3 runs) | 108.9 / 108.7 / 108.8 | 361.6 / 363.4 / 363.7 | 449.6 / 458.1 / 455.3 | 2,928 / 3,004 / 2,982 | 2,661 / 2,730 / 2,691 | 79.0-84.7 | 154-184 |
+| lds, DFly2 | 110.0 | 362.8 | 424.5 | 2,956 | 2,680 | 80.3-86.0 | 150-195 |
+| 2g, DFly2 (3 runs) | 99.8 / 99.7 / 97.6 | 344.0 / 345.3 / 328.6 | 562.1 / 566.0 / 522.5 | 2,995 / 2,953 / 2,614 | 2,714 / 2,745 / 2,476 | 80.8-82.6 | 161-208 |
+
+DFly2 at 8 clients varies run to run on 2.2 (425-603 in `docs/BENCH-2026-11-21.md`), so 2g's
+522-566 against 450-458 is suggestive, not settled. The third 2g DFly2 run was slower in prefill too
+(2,614 / 2,476), so part of its decode drop is that run's. Next steps for form 2g: an envelope measured
+in 32-row steps (several legal per-head reorders) or a BFCL run, to decide the default; and the
+block-key variant above for DFly2 at 1 client.
+
+## Done on 2026-11-23: concurrent and chained hy4k launches
+
+From the Inkling 2 plugin (rounds 4 and 7) and the #586 survey. Details and the table are in
+`docs/DESIGN.md`, "Concurrent and chained hy4k launches".
+
+- `rad_kernel_concurrent` (every card row): within 1-2 %, bit for bit.
+- `rad_kernel_chain` = 2, with chained forms only for launches of up to 64 rows:
+  - Without DFly2: decode +6.5 % at one client, +4 % at 4 and 8, chat +5 %.
+  - With DFly2: +3.5 % / +4.5 % / +1 %.
+  - Prefill unchanged.
+  - KL bit for bit, both in 2048-row chunks and in 32-row steps.
+- Chaining prefill launches too lost 7-9 % of prefill, so they stay plain.
+- `RADIANCE_AQL_CHAIN_FENCE=1` is no longer needed with DFly2: 8 clients gave 462 tok/s without it
+  and 456 with it, with the same drafter acceptance.
+
+- **Wide `hy4_mla_project`** (`mla_proj2_k`: Direct-B loads after gostar's #586, `global_load_tr_b128`
+  for the absorb weight, 4x4-wave tiles, a step-ahead prefetch, head-major grid):
+  - Prefill +9-11 % at 5.7K, +11 % at 18K, +7-9 % at 73K. Decode unchanged.
+  - Bit for bit with `mla_proj_k`, and the 4096-row superlinear cost is gone. Details in `docs/DESIGN.md`,
+    "The wide mla_project".
+
+Next on the list: row 3 (`router_fuse`), which is still a one-liner, and the int8 head for the DFly2
+drafter.
